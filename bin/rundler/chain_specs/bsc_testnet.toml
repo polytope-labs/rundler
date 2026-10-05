@@ -1,0 +1,7 @@
+base = "bsc"
+
+name = "BNB Smart Chain Testnet"
+id = 97
+
+min_max_priority_fee_per_gas = 100000000
+block_gas_limit = 100000000
