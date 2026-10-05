@@ -1,0 +1,9 @@
+name = "BNB Smart Chain"
+id = 56
+
+priority_fee_oracle_type = "USAGE_BASED"
+min_max_priority_fee_per_gas = 50000000
+block_gas_limit = 70000000
+transaction_gas_limit = 16777216
+eip7702_enabled = true
+eip7623_enabled = true

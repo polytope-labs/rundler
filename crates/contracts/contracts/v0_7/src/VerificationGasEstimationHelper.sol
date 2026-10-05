@@ -146,7 +146,14 @@ contract VerificationGasEstimationHelper {
         uint256 offset = UserOperationLib.PAYMASTER_VALIDATION_GAS_OFFSET;
         assembly {
             let ptr := add(add(paymasterAndData, 0x20), offset)
-            mstore(ptr, shl(128, value))
+            // Keep the low 16 bytes, which hold paymasterPostOpGasLimit.
+            mstore(
+                ptr,
+                or(
+                    and(mload(ptr), 0xffffffffffffffffffffffffffffffff),
+                    shl(128, value)
+                )
+            )
         }
 
         _setFeesFields(userOp, constantFee);

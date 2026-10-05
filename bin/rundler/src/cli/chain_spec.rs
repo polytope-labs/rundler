@@ -122,5 +122,7 @@ define_hardcoded_chain_specs!(
     polygon,
     polygon_amoy,
     avax,
-    avax_fuji
+    avax_fuji,
+    bsc,
+    bsc_testnet
 );
