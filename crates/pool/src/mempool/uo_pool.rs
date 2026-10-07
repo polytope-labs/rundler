@@ -1035,6 +1035,21 @@ where
     fn get_operation_status(&self, hash: B256) -> Option<PoolOperationStatus> {
         self.state.read().pool.get_operation_status(hash)
     }
+
+    fn is_quiescent(&self) -> bool {
+        self.state.read().pool.is_quiescent()
+    }
+
+    // A paused chain watcher misses Deposited events, so a top-up made while
+    // paused would leave a stale cached balance behind. Expiry and entity
+    // removal drop ops without releasing their paymaster liability, so with no
+    // ops left every remaining liability is stale.
+    fn on_idle_pause(&self) {
+        let pool_quiescent = self.state.read().pool.is_quiescent();
+        if pool_quiescent {
+            self.paymaster.clear();
+        }
+    }
 }
 
 // Type erasure for UoPool providers
@@ -1917,6 +1932,99 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(ret, MempoolError::PaymasterBalanceTooLow(_, _)));
+    }
+
+    #[tokio::test]
+    async fn on_idle_pause_clears_paymaster_balances_only_without_pending_ops() {
+        let paymaster = Address::random();
+        let mut entrypoint = MockEntryPointV0_6::new();
+        entrypoint
+            .expect_balance_of()
+            .returning(|_, _| Ok(U256::from(1000)));
+
+        let (pool, uos) = create_pool_with_entrypoint_insert_ops(
+            vec![create_op(Address::random(), 0, 1, Some(paymaster))],
+            entrypoint,
+        )
+        .await;
+        assert!(!pool.is_quiescent());
+        assert_eq!(pool.dump_paymaster_balances().len(), 1);
+
+        pool.on_idle_pause();
+        assert_eq!(pool.dump_paymaster_balances().len(), 1);
+
+        pool.remove_operations(&[uos[0].hash()]);
+        assert!(pool.is_quiescent());
+        assert_eq!(pool.dump_paymaster_balances().len(), 1);
+
+        pool.on_idle_pause();
+        assert!(pool.dump_paymaster_balances().is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_idle_pause_drops_liability_left_by_an_expired_op() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let paymaster = Address::random();
+        let deposit = Arc::new(AtomicU64::new(1000));
+        let mut entrypoint = MockEntryPointV0_6::new();
+        let balance = deposit.clone();
+        entrypoint
+            .expect_balance_of()
+            .returning(move |_, _| Ok(U256::from(balance.load(Ordering::Relaxed))));
+
+        let paymaster_op = |sender| {
+            create_op_from_required(UserOperationRequiredFields {
+                sender,
+                call_gas_limit: 10,
+                verification_gas_limit: 10,
+                pre_verification_gas: 10,
+                max_fee_per_gas: 1,
+                paymaster_and_data: paymaster.to_vec().into(),
+                ..Default::default()
+            })
+        };
+        let mut op = paymaster_op(Address::random());
+        op.valid_time_range = ValidTimeRange {
+            valid_after: 0.into(),
+            valid_until: 10.into(),
+        };
+
+        let (pool, uos) = create_pool_with_entrypoint_insert_ops(vec![op], entrypoint).await;
+        assert!(!pool.is_quiescent());
+        assert_eq!(
+            pool.dump_paymaster_balances()[0].pending_balance,
+            U256::from(950)
+        );
+
+        pool.on_chain_update(&ChainUpdate {
+            latest_block_timestamp: 11.into(),
+            ..ChainUpdate::default()
+        })
+        .await;
+        assert!(pool.get_user_operation_by_hash(uos[0].hash()).is_none());
+        assert!(pool.is_quiescent());
+        assert_eq!(
+            pool.dump_paymaster_balances()[0].pending_balance,
+            U256::from(950)
+        );
+
+        pool.on_idle_pause();
+        assert!(pool.dump_paymaster_balances().is_empty());
+
+        deposit.store(2000, Ordering::Relaxed);
+        pool.add_operation(
+            OperationOrigin::Local,
+            paymaster_op(Address::random()).op,
+            default_perms(),
+        )
+        .await
+        .unwrap();
+
+        let balances = pool.dump_paymaster_balances();
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].confirmed_balance, U256::from(2000));
+        assert_eq!(balances[0].pending_balance, U256::from(1950));
     }
 
     #[tokio::test]

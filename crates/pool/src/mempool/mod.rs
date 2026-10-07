@@ -168,6 +168,14 @@ pub(crate) trait Mempool: Send + Sync {
 
     /// Get extended status for a user operation.
     fn get_operation_status(&self, hash: B256) -> Option<PoolOperationStatus>;
+
+    /// Returns true when the pool holds no pending operations and no mined
+    /// operations that a reorg could return to it.
+    fn is_quiescent(&self) -> bool;
+
+    /// Called when chain polling pauses, to drop state that the paused chain
+    /// watcher can no longer keep current.
+    fn on_idle_pause(&self);
 }
 
 /// Config for the mempool

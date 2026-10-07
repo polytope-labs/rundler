@@ -19,7 +19,10 @@ use clap::Args;
 use rundler_pool::{LocalPoolBuilder, PoolConfig, PoolTask, PoolTaskArgs};
 use rundler_provider::Providers;
 use rundler_sim::MempoolConfigs;
-use rundler_task::TaskSpawnerExt;
+use rundler_task::{
+    TaskSpawnerExt,
+    idle::{IdleGate, IdleSettings},
+};
 use rundler_types::{
     EntryPointVersion,
     chain::{ChainSpec, TryIntoWithSpec},
@@ -235,9 +238,36 @@ pub struct PoolArgs {
         default_value = "600"
     )]
     pub suspect_rpc_backoff_max_secs: u64,
+
+    /// Stop polling the node while nothing is pending or in flight. Needs the
+    /// pool and builder in one process (the `node` or `backend` command).
+    #[arg(
+        long = "pool.idle_pause_enabled",
+        name = "pool.idle_pause_enabled",
+        env = "POOL_IDLE_PAUSE_ENABLED",
+        default_value = "false"
+    )]
+    pub idle_pause_enabled: bool,
+
+    /// How long the pool and builder must stay idle before polling pauses.
+    #[arg(
+        long = "pool.idle_pause_grace_millis",
+        name = "pool.idle_pause_grace_millis",
+        env = "POOL_IDLE_PAUSE_GRACE_MILLIS",
+        default_value = "60000"
+    )]
+    pub idle_pause_grace_millis: u64,
 }
 
 impl PoolArgs {
+    /// Settings for the idle gate shared by the pool and builder.
+    pub fn idle_settings(&self) -> IdleSettings {
+        IdleSettings {
+            enabled: self.idle_pause_enabled,
+            grace: Duration::from_millis(self.idle_pause_grace_millis),
+        }
+    }
+
     /// Convert the CLI arguments into the arguments for the OP Pool combining
     /// common and op pool specific arguments.
     pub async fn to_args(
@@ -338,6 +368,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
     mempool_configs: Option<MempoolConfigs>,
 ) -> anyhow::Result<()> {
     let PoolCliArgs { pool: pool_args } = pool_args;
+    let idle_gate = standalone_idle_gate(&pool_args)?;
     let (event_sender, event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     let task_args = pool_args
         .to_args(
@@ -358,9 +389,66 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         event_sender,
         LocalPoolBuilder::new(BLOCK_CHANNEL_CAPACITY),
         providers,
+        idle_gate,
     )
     .spawn(task_spawner)
     .await?;
 
     Ok(())
+}
+
+// The gate lives in process, so a builder in another process could neither
+// hold it nor see the resume floor.
+fn standalone_idle_gate(pool_args: &PoolArgs) -> anyhow::Result<IdleGate> {
+    if pool_args.idle_pause_enabled {
+        anyhow::bail!(
+            "pool.idle_pause_enabled needs the pool and builder in one process; \
+             use the node or backend command"
+        );
+    }
+    Ok(IdleGate::disabled())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        pool: PoolArgs,
+    }
+
+    fn pool_args(args: &[&str]) -> PoolArgs {
+        TestCli::parse_from(std::iter::once("test").chain(args.iter().copied())).pool
+    }
+
+    #[test]
+    fn idle_pause_defaults_to_off() {
+        let settings = pool_args(&[]).idle_settings();
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.grace, Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn idle_pause_flags_parse() {
+        let settings = pool_args(&[
+            "--pool.idle_pause_enabled",
+            "--pool.idle_pause_grace_millis",
+            "5000",
+        ])
+        .idle_settings();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.grace, Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn standalone_pool_rejects_idle_pause() {
+        assert!(standalone_idle_gate(&pool_args(&["--pool.idle_pause_enabled"])).is_err());
+        assert!(standalone_idle_gate(&pool_args(&[])).is_ok());
+    }
 }

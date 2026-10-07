@@ -222,6 +222,15 @@ List of command line options for configuring the Pool.
   - env: _POOL_SUSPECT_RPC_BACKOFF_INITIAL_SECS_
 - `--pool.suspect_rpc_backoff_max_secs`: Maximum delay in seconds between suspect isolation attempts (default: `600`)
   - env: _POOL_SUSPECT_RPC_BACKOFF_MAX_SECS_
+- `--pool.idle_pause_enabled`: Stop polling the node while nothing is pending or in flight (default: `false`)
+  - env: _POOL_IDLE_PAUSE_ENABLED_
+  - Only for the `node` and `backend` commands, which run the pool and builder in one process. The standalone `pool` command refuses to start with it set.
+  - Gas estimation and receipt queries keep working while paused, because they query the node directly.
+  - With `--signer.enable_kms_funding` set, the funding task still reads the funding key's balance every 60 seconds while paused.
+  - An operation that can never be bundled keeps the pool from going idle, so polling does not pause unless `--pool.max_time_in_pool_secs` is set to drop it.
+  - See [idle pause](./architecture/pool.md#idle-pause) for details.
+- `--pool.idle_pause_grace_millis`: How long the pool and builder must stay idle before polling pauses, in milliseconds (default: `60000`)
+  - env: _POOL_IDLE_PAUSE_GRACE_MILLIS_
 
 ## Builder Options
 

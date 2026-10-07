@@ -28,6 +28,7 @@ use rundler_provider::{AlloyNetworkConfig, Providers};
 use rundler_sim::MempoolConfigs;
 use rundler_task::{
     TaskSpawnerExt,
+    idle::IdleGate,
     server::{connect_with_retries_shutdown, format_socket_addr},
 };
 use rundler_types::{
@@ -562,6 +563,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         pool,
         providers,
         signer_manager,
+        IdleGate::disabled(),
     )
     .spawn(task_spawner)
     .await?;

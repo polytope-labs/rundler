@@ -44,6 +44,30 @@ Upon receiving a chain update event, the `Pool` will update its internal state b
 
 The `Pool`'s cache depth is configurable, if a re-org occurs that is deeper than the cache, UOs will be unable to be returned to the pool.
 
+### Idle Pause
+
+With `--pool.idle_pause_enabled`, the chain tracker stops polling the node while the bundler is idle. The pool and builder share an in-process idle gate, so this only works with the `node` and `backend` commands.
+
+The tracker pauses after a chain update once all of these hold:
+
+- No mempool has pending UOs, or mined UOs that a re-org within the cache depth could return.
+- Nothing holds the gate. The builder holds it while work is in flight, see [triggers](./builder.md#triggers).
+- `--pool.idle_pause_grace_millis` has passed since the last activity.
+
+Any of these wakes it:
+
+- An `AddOp`, i.e. a UO arriving through `eth_sendUserOperation`.
+- A sponsored delegation queued by the builder.
+- A manual `debug_bundler_sendBundleNow`.
+
+On wake the tracker resyncs from the current head only, without loading the blocks it missed while paused. The pool was empty, so nothing in it depended on those blocks. At pause the pool also clears its cached paymaster balances and liabilities, since the paused tracker cannot keep them current.
+
+Metrics:
+
+- `op_pool_chain_idle_paused`: gauge, `1` while paused.
+- `op_pool_chain_idle_pauses`: count of pauses.
+- `op_pool_chain_idle_resyncs`: count of resyncs from head after a pause.
+
 ## Mempool Config
 
 Default operation of the mempool does not require an explicit configuration file. To use advanced mempool features like filtering and alternative mempool rules, users can specify a specific mempool configuration file using the `--mempool_config_path` CLI option. The schema for this JSON file can be found here: [MempoolConfigs](../../crates/sim/src/simulation/mempool.rs).

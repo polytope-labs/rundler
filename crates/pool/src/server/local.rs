@@ -28,6 +28,7 @@ use metrics::Histogram;
 use metrics_derive::Metrics;
 use rundler_task::{
     GracefulShutdown, TaskSpawner,
+    idle::IdleGate,
     server::{HealthCheck, ServerStatus},
 };
 use rundler_types::{
@@ -88,6 +89,7 @@ impl LocalPoolBuilder {
         task_spawner: Box<dyn TaskSpawner>,
         mempools: HashMap<Address, Arc<dyn Mempool>>,
         chain_subscriber: ChainSubscriber,
+        idle_gate: IdleGate,
         shutdown: GracefulShutdown,
     ) -> BoxFuture<'static, ()> {
         let runner = LocalPoolServerRunner::new(
@@ -96,6 +98,7 @@ impl LocalPoolBuilder {
             mempools,
             chain_subscriber,
             task_spawner,
+            idle_gate,
         );
         Box::pin(runner.run(shutdown))
     }
@@ -116,6 +119,7 @@ struct LocalPoolServerRunner {
     mempools: HashMap<Address, Arc<dyn Mempool>>,
     chain_subscriber: ChainSubscriber,
     task_spawner: Box<dyn TaskSpawner>,
+    idle_gate: IdleGate,
 }
 
 impl LocalPoolHandle {
@@ -510,6 +514,7 @@ impl LocalPoolServerRunner {
         mempools: HashMap<Address, Arc<dyn Mempool>>,
         chain_subscriber: ChainSubscriber,
         task_spawner: Box<dyn TaskSpawner>,
+        idle_gate: IdleGate,
     ) -> Self {
         Self {
             req_receiver,
@@ -517,6 +522,7 @@ impl LocalPoolServerRunner {
             mempools,
             chain_subscriber,
             task_spawner,
+            idle_gate,
         }
     }
 
@@ -768,6 +774,8 @@ impl LocalPoolServerRunner {
                         // its bundle building process will want to be able to query the mempool
                         // and only receive operations that have not yet been mined.
                         let block_sender = self.block_sender.clone();
+                        let idle_gate = self.idle_gate.clone();
+                        let mempools: Vec<_> = self.mempools.values().cloned().collect();
                         let update_futures : Vec<_> = self.mempools.values().map(|m| {
                             let m = Arc::clone(m);
                             let cu = Arc::clone(&chain_update);
@@ -782,6 +790,10 @@ impl LocalPoolServerRunner {
                                     block_number: chain_update.latest_block_number,
                                     address_updates: chain_update.address_updates.clone(),
                                 });
+                                idle_gate.try_pause(
+                                    || mempools.iter().all(|m| m.is_quiescent()),
+                                    || mempools.iter().for_each(|m| m.on_idle_pause()),
+                                );
                             }
                         }));
                     }
@@ -791,6 +803,7 @@ impl LocalPoolServerRunner {
                         // Async methods
                         // Responses are sent in the spawned task
                         ServerRequestKind::AddOp { entry_point, op, perms, origin } => {
+                            let hold = self.idle_gate.hold();
                             let fut = |mempool: Arc<dyn Mempool>, response: oneshot::Sender<Result<ServerResponse, PoolError>>| async move {
                                 let resp = 'resp: {
                                     match mempool.entry_point_version().abi_version() {
@@ -811,6 +824,7 @@ impl LocalPoolServerRunner {
                                         Err(e) => Err(e.into()),
                                     }
                                 };
+                                drop(hold);
 
                                 if let Err(e) = response.send(resp) {
                                     tracing::error!("Failed to send response: {:?}", e);
@@ -1123,11 +1137,19 @@ enum ServerResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, iter::zip, sync::Arc};
+    use std::{
+        collections::HashSet,
+        iter::zip,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use futures_util::StreamExt;
-    use parking_lot::RwLock;
+    use parking_lot::{Mutex, RwLock};
     use reth_tasks::TaskManager;
+    use rundler_task::idle::IdleSettings;
     use rundler_types::{
         EntityInfos, EntryPointVersion, ValidTimeRange, chain::ChainSpec, da::DAGasData,
         v0_6::UserOperation as UserOperationV0_6, v0_7::UserOperation as UserOperationV0_7,
@@ -1284,6 +1306,143 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_add_op_wakes_and_holds_idle_gate() {
+        let gate = enabled_gate();
+        assert!(gate.try_pause(|| true, || {}));
+
+        let seen_during_add = Arc::new(Mutex::new(None));
+        let mut mock_pool = MockMempool::new();
+        let hash0 = B256::random();
+        mock_pool
+            .expect_entry_point_version()
+            .returning(|| EntryPointVersion::V0_6);
+        mock_pool.expect_add_operation().returning({
+            let gate = gate.clone();
+            let seen_during_add = seen_during_add.clone();
+            move |_, _, _| {
+                *seen_during_add.lock() = Some((gate.is_paused(), gate.try_pause(|| true, || {})));
+                Ok(hash0)
+            }
+        });
+
+        let ep = ChainSpec::default().entry_point_address_v0_6;
+        let pool: Arc<dyn Mempool> = Arc::new(mock_pool);
+        let state = setup_with_gate(HashMap::from([(ep, pool)]), gate.clone());
+
+        let hash1 = state
+            .handle
+            .add_op(mock_op(), UserOperationPermissions::default())
+            .await
+            .unwrap();
+        assert_eq!(hash0, hash1);
+        // Awake and held while the add was running.
+        assert_eq!(*seen_during_add.lock(), Some((false, false)));
+        assert!(gate.try_pause(|| true, || {}));
+    }
+
+    #[tokio::test]
+    async fn test_confirmed_update_pauses_quiescent_pools() {
+        let gate = enabled_gate();
+        let (pool0, calls0) = idle_pool(true);
+        let (pool1, calls1) = idle_pool(true);
+        let state = setup_with_gate(
+            HashMap::from([(Address::random(), pool0), (Address::random(), pool1)]),
+            gate.clone(),
+        );
+
+        let mut new_heads = state.handle.subscribe_new_heads(vec![]).await.unwrap();
+        state
+            .chain_update_tx
+            .send(Arc::new(ChainUpdate::default()))
+            .unwrap();
+        new_heads.next().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_for_pause())
+            .await
+            .unwrap();
+        for calls in [calls0, calls1] {
+            assert_eq!(calls.idle_pauses.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_confirmed_update_keeps_busy_pool_awake() {
+        let gate = enabled_gate();
+        let (pool, calls) = idle_pool(false);
+        let state = setup_with_gate(HashMap::from([(Address::random(), pool)]), gate.clone());
+
+        let mut new_heads = state.handle.subscribe_new_heads(vec![]).await.unwrap();
+        state
+            .chain_update_tx
+            .send(Arc::new(ChainUpdate::default()))
+            .unwrap();
+        new_heads.next().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.quiescent_checks.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!gate.is_paused());
+        assert_eq!(calls.idle_pauses.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_disabled_gate_never_pauses() {
+        let gate = IdleGate::disabled();
+        let (pool, calls) = idle_pool(true);
+        let state = setup_with_gate(HashMap::from([(Address::random(), pool)]), gate.clone());
+
+        let mut new_heads = state.handle.subscribe_new_heads(vec![]).await.unwrap();
+        for _ in 0..2 {
+            state
+                .chain_update_tx
+                .send(Arc::new(ChainUpdate::default()))
+                .unwrap();
+            new_heads.next().await.unwrap();
+        }
+
+        assert!(!gate.is_paused());
+        assert_eq!(calls.quiescent_checks.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.idle_pauses.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Default)]
+    struct IdleCalls {
+        quiescent_checks: AtomicUsize,
+        idle_pauses: AtomicUsize,
+    }
+
+    fn idle_pool(quiescent: bool) -> (Arc<dyn Mempool>, Arc<IdleCalls>) {
+        let calls = Arc::new(IdleCalls::default());
+        let mut mock_pool = MockMempool::new();
+        mock_pool.expect_on_chain_update().returning(|_| ());
+        mock_pool.expect_is_quiescent().returning({
+            let calls = calls.clone();
+            move || {
+                calls.quiescent_checks.fetch_add(1, Ordering::SeqCst);
+                quiescent
+            }
+        });
+        mock_pool.expect_on_idle_pause().returning({
+            let calls = calls.clone();
+            move || {
+                calls.idle_pauses.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (Arc::new(mock_pool), calls)
+    }
+
+    fn enabled_gate() -> IdleGate {
+        IdleGate::new(IdleSettings {
+            enabled: true,
+            grace: Duration::ZERO,
+        })
+    }
+
     struct State {
         handle: LocalPoolHandle,
         chain_update_tx: Arc<broadcast::Sender<Arc<ChainUpdate>>>,
@@ -1291,6 +1450,10 @@ mod tests {
     }
 
     fn setup(pools: HashMap<Address, Arc<dyn Mempool>>) -> State {
+        setup_with_gate(pools, IdleGate::disabled())
+    }
+
+    fn setup_with_gate(pools: HashMap<Address, Arc<dyn Mempool>>, idle_gate: IdleGate) -> State {
         let builder = LocalPoolBuilder::new(10);
         let handle = builder.get_handle();
         let (tx, _) = broadcast::channel(10);
@@ -1304,7 +1467,7 @@ mod tests {
         };
 
         ts.spawn_critical_with_graceful_shutdown_signal("test pool", |shutdown| {
-            builder.run(ts_box, pools, chain_subscriber, shutdown)
+            builder.run(ts_box, pools, chain_subscriber, idle_gate, shutdown)
         });
 
         State {

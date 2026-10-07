@@ -29,7 +29,7 @@ use rundler_sim::{
     MempoolConfig, SimulationSettings,
     simulation::{self, UnsafeSimulator},
 };
-use rundler_task::TaskSpawnerExt;
+use rundler_task::{TaskSpawnerExt, idle::IdleGate};
 use rundler_types::{
     EntryPointAbiVersion, EntryPointVersion,
     chain::ChainSpec,
@@ -149,6 +149,7 @@ pub struct BuilderTask<Pool, Providers> {
     pool: Pool,
     providers: Providers,
     signer_manager: Arc<dyn SignerManager>,
+    idle_gate: IdleGate,
 }
 
 impl<Pool, Providers> BuilderTask<Pool, Providers> {
@@ -161,6 +162,7 @@ impl<Pool, Providers> BuilderTask<Pool, Providers> {
         pool: Pool,
         providers: Providers,
         signer_manager: Arc<dyn SignerManager>,
+        idle_gate: IdleGate,
     ) -> Self {
         Self {
             args,
@@ -169,6 +171,7 @@ impl<Pool, Providers> BuilderTask<Pool, Providers> {
             pool,
             providers,
             signer_manager,
+            idle_gate,
         }
     }
 }
@@ -311,6 +314,7 @@ where
                 max_delegation_gas: self.args.max_bundle_gas as u64,
             },
             heads_tx.clone(),
+            self.idle_gate.clone(),
         );
         task_spawner
             .spawn_critical_with_graceful_shutdown_signal("delegation sender", |shutdown| {
@@ -574,6 +578,8 @@ where
             sender_settings,
             self.event_sender.clone(),
             provider_event_signal,
+            self.idle_gate.clone(),
+            signer_manager.clone(),
         );
 
         // Spawn each sender as its own independent task

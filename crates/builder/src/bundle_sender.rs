@@ -20,7 +20,11 @@ use async_trait::async_trait;
 use mockall::automock;
 use rand::Rng;
 use rundler_provider::FeeEstimator;
-use rundler_task::TaskSpawner;
+use rundler_signer::SignerManager;
+use rundler_task::{
+    TaskSpawner,
+    idle::{IdleGate, IdleHold},
+};
 use rundler_types::{
     UserOperation,
     builder::BundlingMode,
@@ -93,6 +97,12 @@ pub(crate) struct BundleSenderImpl<T, C> {
     /// Outlives the bundle state machine: it is a property of the endpoint, not
     /// of any one bundle attempt, so state resets must not clear it.
     rate_limit_backoff: RateLimitBackoff,
+    idle_gate: IdleGate,
+    /// Held while this sender has work in flight, so the node keeps being polled.
+    idle_hold: Option<IdleHold>,
+    /// The idle gate's resume epoch as of this sender's last catch-up check.
+    resume_epoch: u64,
+    signer_manager: Arc<dyn SignerManager>,
 }
 
 pub enum BundleSenderAction {
@@ -228,6 +238,7 @@ where
             self.bundle_action_receiver.take().unwrap(),
             Duration::from_millis(self.chain_spec.bundle_max_send_interval_millis),
             self.heads_rx.resubscribe(),
+            self.idle_gate.clone(),
         )
         .await
         .expect("Failed to create bundle sender trigger");
@@ -237,6 +248,8 @@ where
             SenderMachineState::new(sender_trigger, self.transaction_tracker.take().unwrap());
 
         loop {
+            self.update_idle_hold(&state);
+
             // Release the signer before blocking if we are idle: no pending transactions
             // and waiting for the next block trigger. The signing key is not needed
             // during the wait, so it is returned to the pool where it can be borrowed
@@ -262,6 +275,10 @@ where
                     continue;
                 }
             };
+
+            if self.catch_up_after_resume(&mut state).await {
+                continue;
+            }
 
             // Re-acquire the signer now that there is work to do. This is a no-op
             // when the signer was kept (pending transactions existed). If all signers
@@ -316,6 +333,8 @@ where
         settings: Settings,
         event_sender: broadcast::Sender<WithEntryPoint<BuilderEvent>>,
         provider_event_signal: Arc<ProviderEventSignal>,
+        idle_gate: IdleGate,
+        signer_manager: Arc<dyn SignerManager>,
     ) -> Self {
         Self {
             builder_tag,
@@ -332,7 +351,87 @@ where
             event_sender,
             provider_event_signal,
             rate_limit_backoff: RateLimitBackoff::default(),
+            resume_epoch: idle_gate.resume_epoch(),
+            idle_gate,
+            idle_hold: None,
+            signer_manager,
         }
+    }
+
+    /// Holds the idle gate whenever the sender is not idle: a bundle or
+    /// cancellation in flight, a pending reset or an immediate rebuild.
+    fn update_idle_hold<TRIG: Trigger>(&mut self, state: &SenderMachineState<T, TRIG>) {
+        if state.is_signer_releasable() {
+            self.idle_hold = None;
+        } else if self.idle_hold.is_none() {
+            self.idle_hold = Some(self.idle_gate.hold());
+        }
+    }
+
+    /// Catches up on the resync that ends an idle pause, before the first build
+    /// after it. The resync skips the blocks mined during the pause, so cached
+    /// signer balances may be as old as the pause, and a transaction left
+    /// pending may have mined unseen, leaving the tracker's nonce stale.
+    ///
+    /// Returns true when the chain nonce has moved past the tracker's, or could
+    /// not be read, and the state was reset to re-read it. The build is then
+    /// deferred to the next loop iteration.
+    async fn catch_up_after_resume<TRIG: Trigger>(
+        &mut self,
+        state: &mut SenderMachineState<T, TRIG>,
+    ) -> bool {
+        let epoch = self.idle_gate.resume_epoch();
+        if epoch == self.resume_epoch {
+            return false;
+        }
+        self.resume_epoch = epoch;
+        // Any other state holds the gate, so the pause cannot have happened under it.
+        if !matches!(
+            state.inner,
+            InnerState::Building(BuildingState {
+                wait_for_trigger: true,
+                ..
+            })
+        ) {
+            return false;
+        }
+
+        let balances = state
+            .trigger
+            .last_block()
+            .address_updates
+            .iter()
+            .map(|u| (u.address, u.balance))
+            .collect::<Vec<_>>();
+        if !balances.is_empty() {
+            self.signer_manager.update_balances(balances);
+        }
+
+        let tracker = &state.transaction_tracker;
+        if !tracker.has_transactions() {
+            return false;
+        }
+        let nonces = async {
+            let tracker_nonce = tracker.get_state()?.nonce;
+            let chain_nonce = tracker.chain_nonce().await?;
+            Ok::<_, TransactionTrackerError>((tracker_nonce, chain_nonce))
+        };
+        match nonces.await {
+            Ok((tracker_nonce, chain_nonce)) if chain_nonce <= tracker_nonce => {
+                // Unmined, so keep it: the replacement then prices off its recorded fees.
+                info!(
+                    "Transaction with nonce {tracker_nonce} still pending after an idle pause, keeping it"
+                );
+                return false;
+            }
+            Ok((tracker_nonce, chain_nonce)) => info!(
+                "Nonce moved from {tracker_nonce} to {chain_nonce} during an idle pause, resetting"
+            ),
+            Err(e) => warn!("Failed to read the nonce after an idle pause, resetting: {e:?}"),
+        }
+        self.assigner.release_all(self.sender_eoa);
+        state.reset();
+        true
     }
 
     fn increment_counter(
@@ -1720,6 +1819,7 @@ struct BundleSenderTrigger {
     bundle_action_receiver: mpsc::Receiver<BundleSenderAction>,
     timer: tokio::time::Interval,
     last_block: NewHead,
+    idle_gate: IdleGate,
 }
 
 #[async_trait]
@@ -1728,17 +1828,23 @@ impl Trigger for BundleSenderTrigger {
         &mut self,
     ) -> anyhow::Result<Option<oneshot::Sender<SendBundleResult>>> {
         let mut send_bundle_response: Option<oneshot::Sender<SendBundleResult>> = None;
+        // Keeps the gate from pausing again while a manual request waits for the
+        // resume floor, which needs the watcher to keep delivering heads.
+        let mut _manual_hold: Option<IdleHold> = None;
         self.timer.reset();
 
         loop {
             // 3 triggers for loop logic:
             // 1 - new block
             //      - If auto mode, send next bundle
+            //      - If a manual request is waiting on the idle gate, re-check it
             // 2 - timer tick
-            //      - If auto mode, send next bundle
+            //      - If auto mode and the idle gate allows bundling, send next bundle
             // 3 - action recv
             //      - If change mode, change and restart loop
-            //      - If send bundle and manual mode, send next bundle
+            //      - If send bundle and manual mode, wake the idle gate and send next
+            //        bundle once it allows bundling
+            //      - If send bundle while a manual request already waits, reject it
             tokio::select! {
                 b = self.block_rx.recv() => {
                     let Some(b) = b else {
@@ -1751,7 +1857,12 @@ impl Trigger for BundleSenderTrigger {
                 _ = self.timer.tick() => {
                     match self.bundling_mode {
                         BundlingMode::Manual => continue,
-                        BundlingMode::Auto => break,
+                        BundlingMode::Auto => {
+                            if self.bundling_blocked()? {
+                                continue;
+                            }
+                            break;
+                        }
                     }
                 },
                 a = self.bundle_action_receiver.recv() => {
@@ -1763,9 +1874,14 @@ impl Trigger for BundleSenderTrigger {
                         },
                         Some(BundleSenderAction::SendBundle(r)) => {
                             match self.bundling_mode {
+                                BundlingMode::Manual if send_bundle_response.is_some() => {
+                                    let _ = r.responder.send(SendBundleResult::Error(anyhow::anyhow!(
+                                        "a manual bundle request is already pending"
+                                    )));
+                                },
                                 BundlingMode::Manual => {
+                                    _manual_hold = Some(self.idle_gate.hold());
                                     send_bundle_response = Some(r.responder);
-                                    break;
                                 },
                                 BundlingMode::Auto => {
                                     error!("Received bundle send action while in auto mode, ignoring");
@@ -1780,6 +1896,10 @@ impl Trigger for BundleSenderTrigger {
                     }
                 }
             };
+
+            if send_bundle_response.is_some() && !self.bundling_blocked()? {
+                break;
+            }
         }
 
         self.consume_blocks()?;
@@ -1815,6 +1935,7 @@ impl BundleSenderTrigger {
         bundle_action_receiver: mpsc::Receiver<BundleSenderAction>,
         timer_interval: Duration,
         heads_rx: broadcast::Receiver<Arc<NewHead>>,
+        idle_gate: IdleGate,
     ) -> anyhow::Result<Self> {
         let (block_tx, block_rx) = mpsc::unbounded_channel();
 
@@ -1833,7 +1954,17 @@ impl BundleSenderTrigger {
                 block_number: 0,
                 address_updates: vec![],
             },
+            idle_gate,
         })
+    }
+
+    /// Whether the idle gate blocks bundling, judged against the newest
+    /// buffered head.
+    fn bundling_blocked(&mut self) -> anyhow::Result<bool> {
+        self.consume_blocks()?;
+        Ok(self
+            .idle_gate
+            .bundling_blocked(self.last_block.block_number))
     }
 
     async fn block_stream_task(
@@ -1885,16 +2016,26 @@ impl BundleSenderTrigger {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use alloy_primitives::{U256, address};
     use mockall::Sequence;
     use rundler_provider::LatestFeeEstimate;
+    use rundler_signer::{CachedAccountState, SignerLease};
+    use rundler_task::idle::IdleSettings;
     use rundler_types::{
         EntityInfos, GasFees, UserOperationPermissions, ValidTimeRange,
         chain::ChainSpec,
         pool::{AddressUpdate, MockPool, PoolOperation, PoolOperationSummary},
         v0_6::UserOperation,
     };
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::{
+        sync::{broadcast, mpsc},
+        time::timeout,
+    };
 
     use super::*;
     use crate::{
@@ -3383,6 +3524,432 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(1));
     }
 
+    const TRIGGER_INTERVAL: Duration = Duration::from_secs(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn test_auto_trigger_waits_for_idle_gate() {
+        let gate = enabled_gate();
+        let (mut trigger, block_tx, _action_tx) = new_trigger(BundlingMode::Auto, gate.clone());
+        let wait = TRIGGER_INTERVAL * 5;
+
+        assert!(gate.try_pause(|| true, || ()));
+        assert!(timeout(wait, trigger.wait_for_trigger()).await.is_err());
+
+        gate.set_resume_floor(5);
+        gate.touch();
+        block_tx.send(new_head(4)).unwrap();
+        assert!(timeout(wait, trigger.wait_for_trigger()).await.is_err());
+        assert_eq!(trigger.last_block().block_number, 4);
+
+        block_tx.send(new_head(5)).unwrap();
+        let response = timeout(wait, trigger.wait_for_trigger())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.is_none());
+        assert_eq!(trigger.last_block().block_number, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_manual_trigger_wakes_idle_gate_and_waits_for_floor() {
+        let gate = enabled_gate();
+        let (mut trigger, block_tx, action_tx) = new_trigger(BundlingMode::Manual, gate.clone());
+        let wait = TRIGGER_INTERVAL * 5;
+
+        assert!(gate.try_pause(|| true, || ()));
+
+        let (responder, mut response_rx) = oneshot::channel();
+        action_tx
+            .send(BundleSenderAction::SendBundle(SendBundleRequest {
+                responder,
+            }))
+            .await
+            .unwrap();
+
+        let mut waiting = trigger.wait_for_trigger();
+        assert!(timeout(wait, &mut waiting).await.is_err());
+        assert!(!gate.is_paused(), "a manual request wakes the gate");
+        assert!(!gate.try_pause(|| true, || ()));
+
+        // The chain watcher sets the floor once its resync after the wake is done.
+        gate.set_resume_floor(5);
+        block_tx.send(new_head(4)).unwrap();
+        assert!(timeout(wait, &mut waiting).await.is_err());
+
+        block_tx.send(new_head(5)).unwrap();
+        let responder = timeout(wait, &mut waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("manual request responder");
+        drop(waiting);
+        assert_eq!(trigger.last_block().block_number, 5);
+
+        responder
+            .send(SendBundleResult::NoOperationsInitially)
+            .unwrap();
+        assert!(matches!(
+            response_rx.try_recv(),
+            Ok(SendBundleResult::NoOperationsInitially)
+        ));
+        assert!(gate.try_pause(|| true, || ()));
+    }
+
+    #[tokio::test]
+    async fn test_pending_bundle_holds_idle_gate_until_mined() {
+        let Mocks {
+            mock_proposer_t,
+            mut mock_tracker,
+            mut mock_trigger,
+            mut mock_pool,
+        } = new_mocks();
+
+        let mined = new_head_mined(1);
+        let mined_clone = mined.clone();
+        mock_trigger
+            .expect_wait_for_block()
+            .once()
+            .returning(move || {
+                Box::pin({
+                    let mined = mined_clone.clone();
+                    async move { Ok(mined) }
+                })
+            });
+        mock_trigger.expect_last_block().return_const(mined);
+        mock_trigger
+            .expect_builder_must_wait_for_trigger()
+            .return_const(false);
+
+        setup_tracker_default(&mut mock_tracker);
+        mock_tracker.expect_process_update().once().returning(|_| {
+            Box::pin(async {
+                Ok(Some(TrackerUpdate::Mined {
+                    block_number: 1,
+                    nonce: 0,
+                    gas_limit: None,
+                    gas_used: None,
+                    gas_price: None,
+                    tx_hash: B256::ZERO,
+                    attempt_number: 0,
+                    is_success: true,
+                    user_op_events: vec![],
+                }))
+            })
+        });
+
+        mock_pool
+            .expect_get_ops_summaries()
+            .once()
+            .returning(|_, _, _, _| Ok(vec![]));
+
+        let gate = enabled_gate();
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        sender.idle_gate = gate.clone();
+
+        let mut state = new_state_with(
+            mock_trigger,
+            mock_tracker,
+            InnerState::Pending(PendingState {
+                until: 3,
+                fee_increase_count: 0,
+            }),
+        );
+
+        sender.update_idle_hold(&state);
+        assert!(!gate.try_pause(|| true, || ()));
+
+        // Mined: auto mode rebuilds straight away, so the gate stays held.
+        let update = state.wait_for_trigger().await.unwrap();
+        sender.step_after_trigger(&mut state, update).await.unwrap();
+        sender.update_idle_hold(&state);
+        assert!(matches!(
+            state.inner,
+            InnerState::Building(BuildingState {
+                wait_for_trigger: false,
+                ..
+            })
+        ));
+        assert!(!gate.try_pause(|| true, || ()));
+
+        // The rebuild finds nothing to bundle, so the sender idles.
+        let update = state.wait_for_trigger().await.unwrap();
+        sender.step_after_trigger(&mut state, update).await.unwrap();
+        sender.update_idle_hold(&state);
+        assert!(state.is_signer_releasable());
+        assert!(gate.try_pause(|| true, || ()));
+    }
+
+    #[tokio::test]
+    async fn test_resume_resets_tracker_when_pending_transaction_mined() {
+        let Mocks {
+            mock_proposer_t,
+            mut mock_tracker,
+            mut mock_trigger,
+            mut mock_pool,
+        } = new_mocks();
+        let mut seq = Sequence::new();
+        let recorder = Arc::new(BalanceRecorder::default());
+        let was_reset = Arc::new(AtomicBool::new(false));
+
+        expect_resumed_trigger(&mut mock_trigger, &mut mock_tracker);
+        mock_tracker.expect_has_transactions().returning({
+            let was_reset = was_reset.clone();
+            move || !was_reset.load(Ordering::SeqCst)
+        });
+        mock_tracker.expect_num_pending_transactions().returning({
+            let was_reset = was_reset.clone();
+            move || usize::from(!was_reset.load(Ordering::SeqCst))
+        });
+        mock_tracker
+            .expect_chain_nonce()
+            .once()
+            .returning(|| Box::pin(async { Ok(TRACKER_NONCE + 1) }));
+        mock_tracker
+            .expect_reset()
+            .once()
+            .in_sequence(&mut seq)
+            .returning({
+                let was_reset = was_reset.clone();
+                let recorder = recorder.clone();
+                move || {
+                    assert_eq!(
+                        recorder.balances(),
+                        [(Address::ZERO, RESUMED_BALANCE)],
+                        "balances are applied before the reset"
+                    );
+                    was_reset.store(true, Ordering::SeqCst);
+                    Box::pin(async {})
+                }
+            });
+        mock_pool
+            .expect_get_ops_summaries()
+            .once()
+            .in_sequence(&mut seq)
+            .returning(|_, _, _, _| Ok(vec![]));
+
+        let gate = enabled_gate();
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        sender.idle_gate = gate.clone();
+        sender.signer_manager = recorder.clone();
+        lock_uo_sender(&sender);
+        let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
+
+        gate.set_resume_floor(10);
+        state.wait_for_trigger().await.unwrap();
+        assert!(sender.catch_up_after_resume(&mut state).await);
+        assert!(state.requires_reset);
+        assert!(!was_reset.load(Ordering::SeqCst));
+        assert!(!holds_uo_sender_lock(&sender), "locks are released");
+
+        // The next loop iteration resets the tracker, then builds straight away.
+        let update = state.wait_for_trigger().await.unwrap();
+        assert!(was_reset.load(Ordering::SeqCst));
+        assert!(!sender.catch_up_after_resume(&mut state).await);
+        sender.step_after_trigger(&mut state, update).await.unwrap();
+        assert!(state.is_signer_releasable());
+    }
+
+    #[tokio::test]
+    async fn test_resume_resets_tracker_holding_only_unhashed_transaction() {
+        let Mocks {
+            mock_proposer_t,
+            mut mock_tracker,
+            mut mock_trigger,
+            mock_pool,
+        } = new_mocks();
+
+        expect_resumed_trigger(&mut mock_trigger, &mut mock_tracker);
+        mock_tracker.expect_has_transactions().return_const(true);
+        mock_tracker
+            .expect_num_pending_transactions()
+            .return_const(0_usize);
+        mock_tracker
+            .expect_chain_nonce()
+            .once()
+            .returning(|| Box::pin(async { Ok(TRACKER_NONCE + 1) }));
+        mock_tracker
+            .expect_reset()
+            .once()
+            .returning(|| Box::pin(async {}));
+
+        let gate = enabled_gate();
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        sender.idle_gate = gate.clone();
+        lock_uo_sender(&sender);
+        let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
+
+        gate.set_resume_floor(10);
+        state.wait_for_trigger().await.unwrap();
+        assert!(sender.catch_up_after_resume(&mut state).await);
+        assert!(state.requires_reset);
+        assert!(!holds_uo_sender_lock(&sender));
+
+        state.wait_for_trigger().await.unwrap();
+        assert!(!state.requires_reset);
+    }
+
+    #[tokio::test]
+    async fn test_resume_keeps_transaction_still_pending() {
+        let Mocks {
+            mock_proposer_t,
+            mut mock_tracker,
+            mut mock_trigger,
+            mock_pool,
+        } = new_mocks();
+
+        expect_resumed_trigger(&mut mock_trigger, &mut mock_tracker);
+        mock_tracker.expect_has_transactions().return_const(true);
+        mock_tracker
+            .expect_num_pending_transactions()
+            .return_const(1_usize);
+        mock_tracker
+            .expect_chain_nonce()
+            .once()
+            .returning(|| Box::pin(async { Ok(TRACKER_NONCE) }));
+        mock_tracker.expect_reset().never();
+
+        let gate = enabled_gate();
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        sender.idle_gate = gate.clone();
+        lock_uo_sender(&sender);
+        let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
+
+        gate.set_resume_floor(10);
+        state.wait_for_trigger().await.unwrap();
+        assert!(!sender.catch_up_after_resume(&mut state).await);
+        assert!(!state.requires_reset);
+        assert!(matches!(
+            state.inner,
+            InnerState::Building(BuildingState {
+                wait_for_trigger: true,
+                ..
+            })
+        ));
+        assert!(holds_uo_sender_lock(&sender), "in-flight locks are kept");
+    }
+
+    #[tokio::test]
+    async fn test_resume_resets_tracker_when_nonce_read_fails() {
+        let Mocks {
+            mock_proposer_t,
+            mut mock_tracker,
+            mut mock_trigger,
+            mock_pool,
+        } = new_mocks();
+
+        expect_resumed_trigger(&mut mock_trigger, &mut mock_tracker);
+        mock_tracker.expect_has_transactions().return_const(true);
+        mock_tracker
+            .expect_num_pending_transactions()
+            .return_const(1_usize);
+        mock_tracker.expect_chain_nonce().once().returning(|| {
+            Box::pin(async {
+                Err(TransactionTrackerError::Other(anyhow::anyhow!(
+                    "rpc unavailable"
+                )))
+            })
+        });
+
+        let gate = enabled_gate();
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        sender.idle_gate = gate.clone();
+        lock_uo_sender(&sender);
+        let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
+
+        gate.set_resume_floor(10);
+        state.wait_for_trigger().await.unwrap();
+        assert!(sender.catch_up_after_resume(&mut state).await);
+        assert!(state.requires_reset);
+        assert!(!holds_uo_sender_lock(&sender));
+    }
+
+    #[tokio::test]
+    async fn test_resume_without_tracked_transactions_skips_reset() {
+        let Mocks {
+            mock_proposer_t,
+            mut mock_tracker,
+            mut mock_trigger,
+            mut mock_pool,
+        } = new_mocks();
+        let recorder = Arc::new(BalanceRecorder::default());
+
+        expect_resumed_trigger(&mut mock_trigger, &mut mock_tracker);
+        mock_tracker.expect_has_transactions().return_const(false);
+        mock_tracker
+            .expect_num_pending_transactions()
+            .return_const(0_usize);
+        mock_tracker.expect_chain_nonce().never();
+        mock_tracker.expect_reset().never();
+        mock_pool
+            .expect_get_ops_summaries()
+            .once()
+            .returning(|_, _, _, _| Ok(vec![]));
+
+        let gate = enabled_gate();
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        sender.idle_gate = gate.clone();
+        sender.signer_manager = recorder.clone();
+        let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
+
+        gate.set_resume_floor(10);
+        let update = state.wait_for_trigger().await.unwrap();
+        assert!(!sender.catch_up_after_resume(&mut state).await);
+        assert!(!state.requires_reset);
+        assert_eq!(recorder.balances(), [(Address::ZERO, RESUMED_BALANCE)]);
+
+        sender.step_after_trigger(&mut state, update).await.unwrap();
+        assert!(state.is_signer_releasable());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_second_manual_request_rejected_while_first_waits() {
+        let gate = enabled_gate();
+        let (mut trigger, block_tx, action_tx) = new_trigger(BundlingMode::Manual, gate.clone());
+        let wait = TRIGGER_INTERVAL * 5;
+
+        assert!(gate.try_pause(|| true, || ()));
+
+        let (first, mut first_rx) = oneshot::channel();
+        action_tx
+            .send(BundleSenderAction::SendBundle(SendBundleRequest {
+                responder: first,
+            }))
+            .await
+            .unwrap();
+        let mut waiting = trigger.wait_for_trigger();
+        assert!(timeout(wait, &mut waiting).await.is_err());
+
+        let (second, mut second_rx) = oneshot::channel();
+        action_tx
+            .send(BundleSenderAction::SendBundle(SendBundleRequest {
+                responder: second,
+            }))
+            .await
+            .unwrap();
+        assert!(timeout(wait, &mut waiting).await.is_err());
+        match second_rx.try_recv() {
+            Ok(SendBundleResult::Error(e)) => assert!(e.to_string().contains("already pending")),
+            other => panic!("unexpected response to the second request: {other:?}"),
+        }
+
+        gate.set_resume_floor(1);
+        block_tx.send(new_head(1)).unwrap();
+        let responder = timeout(wait, &mut waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("first request responder");
+        drop(waiting);
+
+        responder
+            .send(SendBundleResult::NoOperationsInitially)
+            .unwrap();
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(SendBundleResult::NoOperationsInitially)
+        ));
+    }
+
     #[tokio::test]
     async fn test_revert_reports_suspects_and_removes() {
         let Mocks {
@@ -3547,6 +4114,8 @@ mod tests {
             },
             broadcast::channel(1000).0,
             Arc::new(ProviderEventSignal::default()),
+            IdleGate::disabled(),
+            Arc::new(BalanceRecorder::default()),
         )
     }
 
@@ -3583,7 +4152,156 @@ mod tests {
             },
             broadcast::channel(1000).0,
             Arc::new(ProviderEventSignal::default()),
+            IdleGate::disabled(),
+            Arc::new(BalanceRecorder::default()),
         )
+    }
+
+    fn enabled_gate() -> IdleGate {
+        IdleGate::new(IdleSettings {
+            enabled: true,
+            grace: Duration::ZERO,
+        })
+    }
+
+    /// A signer manager that only records the balances it is given.
+    #[derive(Default)]
+    struct BalanceRecorder {
+        balances: Mutex<Vec<(Address, U256)>>,
+    }
+
+    impl BalanceRecorder {
+        fn balances(&self) -> Vec<(Address, U256)> {
+            self.balances.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SignerManager for BalanceRecorder {
+        fn addresses(&self) -> Vec<Address> {
+            vec![]
+        }
+
+        fn available(&self) -> usize {
+            0
+        }
+
+        async fn wait_for_available(&self, _: usize) -> rundler_signer::Result<()> {
+            Ok(())
+        }
+
+        fn lease_signer(&self) -> Option<SignerLease> {
+            None
+        }
+
+        fn lease_signer_by_address(&self, _: &Address) -> Option<SignerLease> {
+            None
+        }
+
+        fn return_lease(&self, _: SignerLease) {}
+
+        fn cached_account_state(&self, _: Address) -> Option<CachedAccountState> {
+            None
+        }
+
+        fn set_account_state(&self, _: Address, _: u64, _: U256) {}
+
+        fn invalidate_account_state(&self, _: Address) {}
+
+        fn update_balances(&self, balances: Vec<(Address, U256)>) {
+            self.balances.lock().unwrap().extend(balances);
+        }
+
+        fn fund_signers(&self) -> rundler_signer::Result<()> {
+            Ok(())
+        }
+    }
+
+    const RESUMED_BALANCE: U256 = U256::from_limbs([5, 0, 0, 0]);
+
+    /// The head an idle sender's trigger fires on after a resync, carrying its
+    /// signer's balance but no nonce, as no transaction of its mined in it.
+    fn resumed_head() -> NewHead {
+        NewHead {
+            block_number: 10,
+            block_hash: B256::ZERO,
+            address_updates: vec![AddressUpdate {
+                address: Address::ZERO,
+                nonce: None,
+                balance: RESUMED_BALANCE,
+                mined_tx_hashes: vec![],
+            }],
+        }
+    }
+
+    const TRACKER_NONCE: u64 = 3;
+
+    /// Sets up an idle sender whose next trigger fires on [`resumed_head`],
+    /// with its tracker at [`TRACKER_NONCE`].
+    fn expect_resumed_trigger(
+        mock_trigger: &mut MockTrigger,
+        mock_tracker: &mut MockTransactionTracker,
+    ) {
+        mock_trigger
+            .expect_wait_for_trigger()
+            .once()
+            .returning(|| Box::pin(async { Ok(None) }));
+        mock_trigger
+            .expect_last_block()
+            .return_const(resumed_head());
+        mock_tracker.expect_address().return_const(Address::ZERO);
+        mock_tracker
+            .expect_process_update()
+            .once()
+            .returning(|_| Box::pin(async { Ok(None) }));
+        mock_tracker.expect_get_state().returning(|| {
+            Ok(TrackerState {
+                nonce: TRACKER_NONCE,
+                balance: U256::ZERO,
+                required_fees: None,
+            })
+        });
+    }
+
+    const LOCKED_UO_SENDER: Address = Address::repeat_byte(0x11);
+
+    /// Gives the sender a confirmed lock on [`LOCKED_UO_SENDER`], as a bundle
+    /// sent before the pause would have.
+    fn lock_uo_sender(sender: &BundleSenderImpl<MockTransactionTracker, Arc<MockPool>>) {
+        sender.assigner.test_establish_pin(
+            sender.sender_eoa,
+            &[LOCKED_UO_SENDER],
+            (ENTRY_POINT_ADDRESS_V0_6, None),
+        );
+    }
+
+    fn holds_uo_sender_lock(
+        sender: &BundleSenderImpl<MockTransactionTracker, Arc<MockPool>>,
+    ) -> bool {
+        sender
+            .assigner
+            .test_holds_confirmed_lock(sender.sender_eoa, LOCKED_UO_SENDER)
+    }
+
+    fn new_trigger(
+        bundling_mode: BundlingMode,
+        idle_gate: IdleGate,
+    ) -> (
+        BundleSenderTrigger,
+        UnboundedSender<NewHead>,
+        mpsc::Sender<BundleSenderAction>,
+    ) {
+        let (block_tx, block_rx) = mpsc::unbounded_channel();
+        let (action_tx, bundle_action_receiver) = mpsc::channel(1);
+        let trigger = BundleSenderTrigger {
+            bundling_mode,
+            block_rx,
+            bundle_action_receiver,
+            timer: tokio::time::interval(TRIGGER_INTERVAL),
+            last_block: new_head(0),
+            idle_gate,
+        };
+        (trigger, block_tx, action_tx)
     }
 
     fn add_trigger_no_update_last_block(

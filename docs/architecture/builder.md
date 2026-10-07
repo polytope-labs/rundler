@@ -132,6 +132,8 @@ While in the building state the sender is waiting for a trigger. There are 3 typ
 * Time (building mode: auto): Trigger bundle building after `bundle_max_send_interval_millis` (chain spec) has elapsed without a bundle attempt.
 * Manual call (building mode: manual): Trigger bundle building on a call to `debug_bundler_sendBundleNow`.
 
+With [idle pause](./pool.md#idle-pause) enabled, the builder shares the pool's idle gate. A bundle sender holds the gate whenever it is not idle waiting for its next trigger, and the delegation sender holds it while a delegation is queued or awaiting its receipt. Before its first build after a wake, a bundle sender applies the signer balances from the resynced head and, if it still tracks transactions, re-reads its nonce from chain, since the resync skips the blocks they may have mined in. It drops its record of those transactions only if they were already mined; otherwise it keeps them, so the next replacement is priced off their recorded fees. While the gate is paused, bundle triggers are skipped. After a wake they stay skipped until the builder has seen the head the chain tracker resynced to, so no bundle is built from the pre-pause view of the chain. A manual call wakes the gate and holds it while waiting for that head.
+
 ### Underpriced bundle validation
 
 Before submitting, the proposer validates the candidate bundle with an `eth_call` to

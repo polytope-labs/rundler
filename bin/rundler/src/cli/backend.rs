@@ -20,7 +20,7 @@ use rundler_builder::{BuilderEvent, BuilderTask, LocalBuilderBuilder};
 use rundler_pool::{LocalPoolBuilder, PoolEvent, PoolTask};
 use rundler_provider::Providers;
 use rundler_sim::MempoolConfigs;
-use rundler_task::{TaskSpawnerExt, server::format_socket_addr};
+use rundler_task::{TaskSpawnerExt, idle::IdleGate, server::format_socket_addr};
 use rundler_types::chain::ChainSpec;
 use rundler_utils::emit::{self, EVENT_CHANNEL_CAPACITY, WithEntryPoint};
 use tokio::sync::broadcast;
@@ -77,6 +77,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         );
     }
 
+    let idle_gate = IdleGate::new(pool_args.idle_settings());
     let pool_remote_address = format_socket_addr(&pool_args.host, pool_args.port).parse()?;
     let pool_task_args = pool_args
         .to_args(
@@ -145,6 +146,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         pool_event_sender,
         pool_builder,
         providers.clone(),
+        idle_gate.clone(),
     )
     .spawn(task_spawner.clone())
     .await?;
@@ -161,6 +163,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         pool_handle,
         providers,
         signer_manager,
+        idle_gate,
     )
     .spawn(task_spawner)
     .await?;

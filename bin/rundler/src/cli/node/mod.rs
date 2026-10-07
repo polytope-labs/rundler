@@ -17,7 +17,7 @@ use rundler_pool::{LocalPoolBuilder, PoolEvent, PoolTask};
 use rundler_provider::Providers;
 use rundler_rpc::RpcTask;
 use rundler_sim::MempoolConfigs;
-use rundler_task::TaskSpawnerExt;
+use rundler_task::{TaskSpawnerExt, idle::IdleGate};
 use rundler_types::chain::ChainSpec;
 use rundler_utils::emit::{self, EVENT_CHANNEL_CAPACITY, WithEntryPoint};
 use tokio::sync::broadcast;
@@ -63,6 +63,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         rpc: rpc_args,
     } = bundler_args;
 
+    let idle_gate = IdleGate::new(pool_args.idle_settings());
     let pool_task_args = pool_args
         .to_args(
             chain_spec.clone(),
@@ -136,6 +137,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         op_pool_event_sender,
         pool_builder,
         providers.clone(),
+        idle_gate.clone(),
     )
     .spawn(task_spawner.clone())
     .await?;
@@ -147,6 +149,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         pool_handle.clone(),
         providers.clone(),
         signer_manager,
+        idle_gate,
     )
     .spawn(task_spawner.clone())
     .await?;
