@@ -288,13 +288,16 @@ impl<P: EvmProvider> Chain<P> {
                 None
             };
 
-            let latest_update =
-                if let Ok(Some((latest_block_hash, latest_block))) = latest_block_res {
+            // Re-syncing an unchanged head would reload it and report a depth 1 reorg.
+            let latest_update = match latest_block_res {
+                Ok(Some((latest_block_hash, latest_block)))
+                    if self.blocks.back().map(|b| b.hash) != Some(latest_block_hash) =>
+                {
                     self.handle_latest_blocks(latest_block, latest_block_hash)
                         .await
-                } else {
-                    None
-                };
+                }
+                _ => None,
+            };
 
             let chain_update = self.merge_updates(pending_update, latest_update).await;
             if let Some(chian_update) = chain_update {
@@ -1172,7 +1175,10 @@ struct ChainMetrics {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::DerefMut;
+    use std::{
+        ops::DerefMut,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use alloy_consensus::{SignableTransaction, TypedTransaction, transaction::Recovered};
     use alloy_eips::BlockNumberOrTag;
@@ -1250,6 +1256,7 @@ mod tests {
         /// Maps a bundle transaction hash to the user operation hashes its
         /// receipt reports, for `eth_getTransactionReceipt`.
         receipts: Arc<RwLock<HashMap<B256, Vec<B256>>>>,
+        get_logs_calls: Arc<AtomicUsize>,
     }
 
     impl ProviderController {
@@ -1324,6 +1331,10 @@ mod tests {
 
         fn get_block(&self, id: BlockId) -> Option<Block> {
             match id {
+                BlockId::Number(BlockNumberOrTag::Latest) => {
+                    let hash = self.blocks.read().last()?.hash;
+                    self.get_block(hash.into())
+                }
                 BlockId::Number(BlockNumberOrTag::Pending) => {
                     let pending_block = self.pending_block.read();
                     if pending_block.is_none() {
@@ -1383,7 +1394,7 @@ mod tests {
                         ..Default::default()
                     })))
                 }
-                _ => panic!("get_block only supports hash ids"),
+                _ => panic!("get_block only supports latest, pending and hash ids"),
             }
         }
 
@@ -2224,6 +2235,39 @@ mod tests {
         }
     }
 
+    /// Flashblocks polls the latest block every interval. Syncing it again while
+    /// it is unchanged would reload the head and report a depth 1 reorg.
+    #[tokio::test]
+    async fn test_flashblocks_unchanged_latest_is_not_resynced() {
+        let (mut chain, controller) = _new_chain(true);
+        controller.set_blocks(vec![MockBlock::new(hash(0))]);
+
+        let update = chain.wait_for_update_flashblocks().await;
+        assert_eq!(update.update_type, UpdateType::Confirmed);
+        assert_eq!(update.latest_block_hash, hash(0));
+        assert_eq!(controller.get_logs_calls.load(Ordering::SeqCst), 1);
+
+        // Same latest block, only a new flashblock.
+        let bundle = make_transaction_to(addr(0), 0, ENTRY_POINT_ADDRESS_V0_6);
+        controller.set_receipt(bundle.tx_hash(), vec![hash(101)]);
+        controller.set_pending_block(MockBlock::new(B256::ZERO).add_txns(vec![bundle.clone()]));
+        let update = chain.wait_for_update_flashblocks().await;
+        assert_eq!(update.update_type, UpdateType::Preconfirmed);
+        assert_eq!(update.reorg_depth, 0);
+        assert_eq!(
+            update.preconfirmed_txns,
+            vec![(bundle.tx_hash(), vec![hash(101)])]
+        );
+        assert_eq!(controller.get_logs_calls.load(Ordering::SeqCst), 1);
+
+        controller.get_blocks_mut().push(MockBlock::new(hash(1)));
+        let update = chain.wait_for_update_flashblocks().await;
+        assert_eq!(update.update_type, UpdateType::Confirmed);
+        assert_eq!(update.latest_block_hash, hash(1));
+        assert_eq!(update.reorg_depth, 0);
+        assert_eq!(controller.get_logs_calls.load(Ordering::SeqCst), 2);
+    }
+
     fn pending_block(controller: &ProviderController) -> Block {
         controller.get_block(BlockId::pending()).unwrap()
     }
@@ -2257,6 +2301,7 @@ mod tests {
             balances: Arc::new(RwLock::new(HashMap::new())),
             pending_block: Arc::new(RwLock::new(None)),
             receipts: Arc::new(RwLock::new(HashMap::new())),
+            get_logs_calls: Arc::new(AtomicUsize::new(0)),
         };
         let mut provider = MockEvmProvider::new();
 
@@ -2276,6 +2321,7 @@ mod tests {
                 let FilterBlockOption::AtBlockHash(block_hash) = filter.block_option else {
                     panic!("mock provider only supports getLogs at specific block hashes");
                 };
+                controller.get_logs_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(controller.get_logs_by_block_hash(filter, block_hash))
             }
         });
