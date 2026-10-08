@@ -148,6 +148,9 @@ pub(crate) struct DelegationSenderTask<E, F> {
     queue: VecDeque<(DelegationId, Eip7702Auth, Option<u64>)>,
     /// Delegations that have been submitted and are waiting to mine.
     pending: HashSet<DelegationId>,
+    /// Batches submitted and not yet completed. A retried delegation can be
+    /// in more than one, so this is counted apart from `pending`.
+    in_flight: usize,
     /// Delegations that have mined, with their (tx_hash, block_number).
     /// Entries are pruned after MINED_RETENTION_BLOCKS.
     mined: HashMap<DelegationId, (B256, u64)>,
@@ -160,7 +163,7 @@ pub(crate) struct DelegationSenderTask<E, F> {
     fee_estimator: F,
     settings: Settings,
     idle_gate: IdleGate,
-    /// Held while any delegation is queued or awaiting its mined receipt.
+    /// Held while any delegation is queued or a batch awaits its mined receipt.
     idle_hold: Option<IdleHold>,
 }
 
@@ -193,7 +196,15 @@ impl<E, F> DelegationSenderTask<E, F> {
         id
     }
 
+    /// Moves up to `max_size` queued delegations into a batch counted as in flight.
+    fn start_batch(&mut self, max_size: usize) -> Vec<(DelegationId, Eip7702Auth, Option<u64>)> {
+        let size = self.queue.len().min(max_size);
+        self.in_flight += 1;
+        self.queue.drain(..size).collect()
+    }
+
     fn handle_completion(&mut self, event: CompletionEvent) {
+        self.in_flight = self.in_flight.saturating_sub(1);
         for id in &event.ids {
             self.pending.remove(id);
         }
@@ -205,11 +216,8 @@ impl<E, F> DelegationSenderTask<E, F> {
     }
 
     fn update_idle_hold(&mut self) {
-        if self.queue.is_empty() && self.pending.is_empty() {
-            self.idle_hold = None;
-        } else if self.idle_hold.is_none() {
-            self.idle_hold = Some(self.idle_gate.hold());
-        }
+        let busy = !self.queue.is_empty() || self.in_flight > 0;
+        self.idle_gate.set_held(&mut self.idle_hold, busy);
     }
 }
 
@@ -235,6 +243,7 @@ where
             completion_rx,
             queue: VecDeque::new(),
             pending: HashSet::new(),
+            in_flight: 0,
             mined: HashMap::new(),
             current_block: 0,
             heads_tx,
@@ -272,9 +281,7 @@ where
                 .saturating_sub(DELEGATION_BASE_GAS)
                 .saturating_sub(DELEGATION_GAS_BUFFER))
                 / DELEGATION_GAS_PER_AUTH) as usize;
-            let batch_size = self.queue.len().min(max_auths.max(1));
-            let batch: Vec<(DelegationId, Eip7702Auth, Option<u64>)> =
-                self.queue.drain(..batch_size).collect();
+            let batch = self.start_batch(max_auths.max(1));
             let ids: Vec<DelegationId> = batch.iter().map(|(id, _, _)| id.clone()).collect();
             let auths: Vec<Eip7702Auth> = batch.into_iter().map(|(_, auth, _)| auth).collect();
 
@@ -548,7 +555,7 @@ mod tests {
     use std::time::Duration;
 
     use alloy_primitives::{Address, U256};
-    use rundler_signer::{CachedAccountState, SignerLease};
+    use rundler_signer::{CachedAccountState, Result as SignerResult, SignerLease};
     use rundler_task::idle::IdleSettings;
     use rundler_types::authorization::Eip7702Auth;
 
@@ -686,7 +693,7 @@ mod tests {
             0
         }
 
-        async fn wait_for_available(&self, _: usize) -> rundler_signer::Result<()> {
+        async fn wait_for_available(&self, _: usize) -> SignerResult<()> {
             Ok(())
         }
 
@@ -710,7 +717,7 @@ mod tests {
 
         fn update_balances(&self, _: Vec<(Address, U256)>) {}
 
-        fn fund_signers(&self) -> rundler_signer::Result<()> {
+        fn fund_signers(&self) -> SignerResult<()> {
             Ok(())
         }
     }
@@ -731,6 +738,7 @@ mod tests {
             completion_rx,
             queue: VecDeque::new(),
             pending: HashSet::new(),
+            in_flight: 0,
             mined: HashMap::new(),
             current_block: 0,
             heads_tx: broadcast::channel(1).0,
@@ -762,9 +770,37 @@ mod tests {
         assert!(!gate.try_pause(|| true, || ()));
 
         // Drained into a batch that is waiting to mine.
-        task.queue.clear();
+        task.start_batch(1);
         task.update_idle_hold();
         assert!(!gate.try_pause(|| true, || ()));
+
+        task.handle_completion(CompletionEvent {
+            ids: vec![id],
+            result: Ok(B256::ZERO),
+        });
+        task.update_idle_hold();
+        assert!(gate.try_pause(|| true, || ()));
+    }
+
+    #[test]
+    fn idle_gate_held_until_every_batch_of_a_retried_delegation_completes() {
+        let gate = enabled_gate();
+        let mut task = new_task(gate.clone());
+
+        let id = task.enqueue(make_auth(1), None);
+        task.start_batch(1);
+        assert_eq!(task.enqueue(make_auth(1), None), id);
+        task.start_batch(1);
+
+        task.handle_completion(CompletionEvent {
+            ids: vec![id.clone()],
+            result: Ok(B256::ZERO),
+        });
+        task.update_idle_hold();
+        assert!(
+            !gate.try_pause(|| true, || ()),
+            "the retried batch is still in flight"
+        );
 
         task.handle_completion(CompletionEvent {
             ids: vec![id],

@@ -368,11 +368,8 @@ where
     /// Holds the idle gate whenever the sender is not idle: a bundle or
     /// cancellation in flight, a pending reset or an immediate rebuild.
     fn update_idle_hold<TRIG: Trigger>(&mut self, state: &SenderMachineState<T, TRIG>) {
-        if state.is_signer_releasable() {
-            self.idle_hold = None;
-        } else if self.idle_hold.is_none() {
-            self.idle_hold = Some(self.idle_gate.hold());
-        }
+        self.idle_gate
+            .set_held(&mut self.idle_hold, !state.is_signer_releasable());
     }
 
     /// Catches up on the resync that ends an idle pause, before the first build
@@ -2070,7 +2067,7 @@ mod tests {
     use alloy_primitives::{U256, address};
     use mockall::Sequence;
     use rundler_provider::LatestFeeEstimate;
-    use rundler_signer::{CachedAccountState, SignerLease};
+    use rundler_signer::{CachedAccountState, Result as SignerResult, SignerLease};
     use rundler_task::idle::IdleSettings;
     use rundler_types::{
         EntityInfos, GasFees, UserOperationPermissions, ValidTimeRange,
@@ -2080,7 +2077,7 @@ mod tests {
     };
     use tokio::{
         sync::{broadcast, mpsc},
-        time::timeout,
+        time,
     };
 
     use super::*;
@@ -2740,7 +2737,7 @@ mod tests {
             .unwrap();
         assert!(matches!(state.inner, InnerState::Pending(_)));
 
-        let update = timeout(Duration::from_secs(1), state.wait_for_trigger())
+        let update = time::timeout(Duration::from_secs(1), state.wait_for_trigger())
             .await
             .expect("the head buffered during the send should still be processed")
             .unwrap();
@@ -3770,16 +3767,24 @@ mod tests {
         let wait = TRIGGER_INTERVAL * 5;
 
         assert!(gate.try_pause(|| true, || ()));
-        assert!(timeout(wait, trigger.wait_for_trigger()).await.is_err());
+        assert!(
+            time::timeout(wait, trigger.wait_for_trigger())
+                .await
+                .is_err()
+        );
 
-        gate.set_resume_floor(5);
         gate.touch();
+        resync(&gate, 5).await;
         block_tx.send(new_head(4)).unwrap();
-        assert!(timeout(wait, trigger.wait_for_trigger()).await.is_err());
+        assert!(
+            time::timeout(wait, trigger.wait_for_trigger())
+                .await
+                .is_err()
+        );
         assert_eq!(trigger.last_block().block_number, 4);
 
         block_tx.send(new_head(5)).unwrap();
-        let response = timeout(wait, trigger.wait_for_trigger())
+        let response = time::timeout(wait, trigger.wait_for_trigger())
             .await
             .unwrap()
             .unwrap();
@@ -3804,17 +3809,17 @@ mod tests {
             .unwrap();
 
         let mut waiting = trigger.wait_for_trigger();
-        assert!(timeout(wait, &mut waiting).await.is_err());
+        assert!(time::timeout(wait, &mut waiting).await.is_err());
         assert!(!gate.is_paused(), "a manual request wakes the gate");
         assert!(!gate.try_pause(|| true, || ()));
 
         // The chain watcher sets the floor once its resync after the wake is done.
-        gate.set_resume_floor(5);
+        resync(&gate, 5).await;
         block_tx.send(new_head(4)).unwrap();
-        assert!(timeout(wait, &mut waiting).await.is_err());
+        assert!(time::timeout(wait, &mut waiting).await.is_err());
 
         block_tx.send(new_head(5)).unwrap();
-        let responder = timeout(wait, &mut waiting)
+        let responder = time::timeout(wait, &mut waiting)
             .await
             .unwrap()
             .unwrap()
@@ -3971,7 +3976,7 @@ mod tests {
         lock_uo_sender(&sender);
         let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10).await;
         state.wait_for_trigger().await.unwrap();
         assert!(sender.catch_up_after_resume(&mut state).await);
         assert!(state.requires_reset);
@@ -4015,7 +4020,7 @@ mod tests {
         lock_uo_sender(&sender);
         let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10).await;
         state.wait_for_trigger().await.unwrap();
         assert!(sender.catch_up_after_resume(&mut state).await);
         assert!(state.requires_reset);
@@ -4051,7 +4056,7 @@ mod tests {
         lock_uo_sender(&sender);
         let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10).await;
         state.wait_for_trigger().await.unwrap();
         assert!(!sender.catch_up_after_resume(&mut state).await);
         assert!(!state.requires_reset);
@@ -4093,7 +4098,7 @@ mod tests {
         lock_uo_sender(&sender);
         let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10).await;
         state.wait_for_trigger().await.unwrap();
         assert!(sender.catch_up_after_resume(&mut state).await);
         assert!(state.requires_reset);
@@ -4128,7 +4133,7 @@ mod tests {
         sender.signer_manager = recorder.clone();
         let mut state = new_state_with(mock_trigger, mock_tracker, InnerState::new());
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10).await;
         let update = state.wait_for_trigger().await.unwrap();
         assert!(!sender.catch_up_after_resume(&mut state).await);
         assert!(!state.requires_reset);
@@ -4154,7 +4159,7 @@ mod tests {
             .await
             .unwrap();
         let mut waiting = trigger.wait_for_trigger();
-        assert!(timeout(wait, &mut waiting).await.is_err());
+        assert!(time::timeout(wait, &mut waiting).await.is_err());
 
         let (second, mut second_rx) = oneshot::channel();
         action_tx
@@ -4163,15 +4168,15 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(timeout(wait, &mut waiting).await.is_err());
+        assert!(time::timeout(wait, &mut waiting).await.is_err());
         match second_rx.try_recv() {
             Ok(SendBundleResult::Error(e)) => assert!(e.to_string().contains("already pending")),
             other => panic!("unexpected response to the second request: {other:?}"),
         }
 
-        gate.set_resume_floor(1);
+        resync(&gate, 1).await;
         block_tx.send(new_head(1)).unwrap();
-        let responder = timeout(wait, &mut waiting)
+        let responder = time::timeout(wait, &mut waiting)
             .await
             .unwrap()
             .unwrap()
@@ -4401,6 +4406,12 @@ mod tests {
         })
     }
 
+    /// Stands in for the chain watcher's resync after a wake.
+    async fn resync(gate: &IdleGate, block_number: u64) {
+        let pause_generation = gate.wait_for_wake().await;
+        gate.set_resume_floor(block_number, pause_generation);
+    }
+
     /// A signer manager that only records the balances it is given.
     #[derive(Default)]
     struct BalanceRecorder {
@@ -4423,7 +4434,7 @@ mod tests {
             0
         }
 
-        async fn wait_for_available(&self, _: usize) -> rundler_signer::Result<()> {
+        async fn wait_for_available(&self, _: usize) -> SignerResult<()> {
             Ok(())
         }
 
@@ -4449,7 +4460,7 @@ mod tests {
             self.balances.lock().unwrap().extend(balances);
         }
 
-        fn fund_signers(&self) -> rundler_signer::Result<()> {
+        fn fund_signers(&self) -> SignerResult<()> {
             Ok(())
         }
     }

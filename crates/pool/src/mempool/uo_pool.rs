@@ -557,7 +557,7 @@ where
         mut op: UserOperationVariant,
         perms: UserOperationPermissions,
     ) -> MempoolResult<B256> {
-        check_paymaster_allowed(self.config.paymaster_allowlist.as_ref(), &op)?;
+        self.check_admission(&op)?;
 
         // Initial state checks
         let to_replace = {
@@ -835,6 +835,10 @@ where
         });
 
         Ok(hash)
+    }
+
+    fn check_admission(&self, op: &UserOperationVariant) -> MempoolResult<()> {
+        check_paymaster_allowed(self.config.paymaster_allowlist.as_ref(), op)
     }
 
     fn remove_operations(&self, hashes: &[B256]) {
@@ -1971,6 +1975,10 @@ mod tests {
             vec![op.clone()],
         );
 
+        assert!(matches!(
+            pool.check_admission(&op.op),
+            Err(MempoolError::PaymasterNotAllowed(Some(p))) if p == paymaster
+        ));
         let ret = pool
             .add_operation(OperationOrigin::Local, op.op, default_perms())
             .await
@@ -2012,6 +2020,7 @@ mod tests {
             MempoolConfig::default(),
         );
 
+        pool.check_admission(&op.op).unwrap();
         pool.add_operation(OperationOrigin::Local, op.op.clone(), default_perms())
             .await
             .unwrap();

@@ -71,11 +71,11 @@ The tracker pauses after a chain update once all of these hold:
 
 Any of these wakes it:
 
-- An `AddOp`, i.e. a UO arriving through `eth_sendUserOperation`.
+- An `AddOp`, i.e. a UO arriving through `eth_sendUserOperation`, unless the [paymaster allowlist](#paymaster-allowlist) rejects it.
 - A sponsored delegation queued by the builder.
 - A manual `debug_bundler_sendBundleNow`.
 
-On wake the tracker resyncs from the current head only, without loading the blocks it missed while paused. The pool was empty, so nothing in it depended on those blocks. At pause the pool also clears its cached paymaster balances and liabilities, since the paused tracker cannot keep them current.
+On wake the tracker resyncs from the current head only, without loading the blocks it missed while paused. The pool held no UOs at pause, so none depend on those blocks, but paymaster deposits and withdrawals in them go unseen. The pool therefore clears its cached paymaster balances and liabilities at pause, and on the resync it refetches every cached paymaster balance, as after a re-org deeper than the cache.
 
 Metrics:
 

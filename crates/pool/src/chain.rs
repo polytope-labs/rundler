@@ -280,11 +280,11 @@ impl<P: EvmProvider> Chain<P> {
         self.metrics.idle_paused.set(1);
         self.metrics.idle_pauses.increment(1);
 
-        let update = select! {
-            update = async {
-                idle_gate.wait_for_wake().await;
-                self.resync_until_ok().await
-            } => update,
+        let (update, pause_generation) = select! {
+            resumed = async {
+                let pause_generation = idle_gate.wait_for_wake().await;
+                (self.resync_until_ok().await, pause_generation)
+            } => resumed,
             _ = shutdown.clone() => return false,
         };
 
@@ -292,7 +292,7 @@ impl<P: EvmProvider> Chain<P> {
             "Chain watcher resumed at block {}",
             update.latest_block_number
         );
-        idle_gate.set_resume_floor(update.latest_block_number);
+        idle_gate.set_resume_floor(update.latest_block_number, pause_generation);
         let _ = self.sender.send(Arc::new(update));
         self.metrics.idle_paused.set(0);
         self.metrics.idle_resyncs.increment(1);
@@ -330,6 +330,8 @@ impl<P: EvmProvider> Chain<P> {
         self.pending_block_id = None;
         self.sync_error_count = 0;
 
+        // The skipped blocks may hold deposits and withdrawals, so the pool
+        // refetches every cached paymaster balance as after a deep reorg.
         Ok(self.new_update(
             0,
             mined_ops,
@@ -339,7 +341,7 @@ impl<P: EvmProvider> Chain<P> {
             entity_balance_updates,
             vec![],
             address_updates,
-            false,
+            true,
             UpdateType::Confirmed,
         ))
     }
@@ -2472,7 +2474,7 @@ mod tests {
                     balance: U256::from(100),
                     mined_tx_hashes: vec![txn.tx_hash()],
                 }],
-                reorg_larger_than_history: false,
+                reorg_larger_than_history: true,
                 update_type: UpdateType::Confirmed,
             }
         );

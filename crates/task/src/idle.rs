@@ -39,7 +39,7 @@ pub struct IdleSettings {
 #[derive(Clone)]
 pub struct IdleGate {
     state: Arc<Mutex<State>>,
-    signal_tx: Arc<watch::Sender<Signal>>,
+    signal_tx: watch::Sender<Signal>,
 }
 
 #[derive(Debug)]
@@ -49,8 +49,10 @@ struct State {
     holds: usize,
     last_activity: Instant,
     paused: bool,
-    /// Set by a pause and cleared by [`IdleGate::set_resume_floor`], so a
-    /// wake alone does not let bundling resume before the chain resyncs.
+    pause_generation: u64,
+    /// Set by a pause and cleared by [`IdleGate::set_resume_floor`] for a
+    /// resync started after it, so a wake alone does not let bundling resume
+    /// before the chain resyncs.
     resync_pending: bool,
     resume_floor: Option<u64>,
     resume_epoch: u64,
@@ -59,6 +61,7 @@ struct State {
 #[derive(Clone, Copy, Debug, Default)]
 struct Signal {
     paused: bool,
+    pause_generation: u64,
     resync_pending: bool,
 }
 
@@ -80,11 +83,12 @@ impl IdleGate {
                 holds: 0,
                 last_activity: Instant::now(),
                 paused: false,
+                pause_generation: 0,
                 resync_pending: false,
                 resume_floor: None,
                 resume_epoch: 0,
             })),
-            signal_tx: Arc::new(signal_tx),
+            signal_tx,
         }
     }
 
@@ -107,6 +111,16 @@ impl IdleGate {
         state.last_activity = Instant::now();
         self.wake(&mut state);
         IdleHold { gate: self.clone() }
+    }
+
+    /// Keeps `slot` holding the gate while `busy`, and releases its hold
+    /// otherwise.
+    pub fn set_held(&self, slot: &mut Option<IdleHold>, busy: bool) {
+        if !busy {
+            *slot = None;
+        } else if slot.is_none() {
+            *slot = Some(self.hold());
+        }
     }
 
     /// Pauses the gate if it is enabled, unheld, past its grace period and
@@ -138,6 +152,7 @@ impl IdleGate {
         }
         on_pause();
         state.paused = true;
+        state.pause_generation += 1;
         state.resync_pending = true;
         self.publish(&state);
         true
@@ -163,20 +178,31 @@ impl IdleGate {
     }
 
     /// Resolves once the gate is awake, immediately if it is not paused.
-    pub async fn wait_for_wake(&self) {
+    ///
+    /// Returns the pause generation seen awake, which a resync started after
+    /// this call passes to [`IdleGate::set_resume_floor`].
+    pub async fn wait_for_wake(&self) -> u64 {
         let mut rx = self.signal_tx.subscribe();
-        let _ = rx.wait_for(|signal| !signal.paused).await;
+        match rx.wait_for(|signal| !signal.paused).await {
+            Ok(signal) => signal.pause_generation,
+            // Unreachable while the gate owns the sender.
+            Err(_) => self.lock().pause_generation,
+        }
     }
 
-    /// Sets the block number that must be reached before bundling resumes,
-    /// records that the resync after a pause is done and advances the
-    /// [resume epoch](IdleGate::resume_epoch). Call it only once that resync
-    /// has succeeded.
-    pub fn set_resume_floor(&self, block_number: u64) {
+    /// Sets the block number that must be reached before bundling resumes
+    /// and advances the [resume epoch](IdleGate::resume_epoch). Call it only
+    /// once a resync has succeeded, with the pause generation
+    /// [`IdleGate::wait_for_wake`] returned before that resync started.
+    ///
+    /// The resync after a pause is recorded as done only if the gate has not
+    /// paused again since that generation. Otherwise bundling keeps waiting
+    /// for the resync after the later pause.
+    pub fn set_resume_floor(&self, block_number: u64, pause_generation: u64) {
         let mut state = self.lock();
         state.resume_floor = Some(block_number);
         state.resume_epoch += 1;
-        if state.resync_pending {
+        if state.resync_pending && state.pause_generation == pause_generation {
             state.resync_pending = false;
             self.publish(&state);
         }
@@ -214,6 +240,7 @@ impl IdleGate {
     fn publish(&self, state: &State) {
         self.signal_tx.send_replace(Signal {
             paused: state.paused,
+            pause_generation: state.pause_generation,
             resync_pending: state.resync_pending,
         });
     }
@@ -237,7 +264,6 @@ impl Drop for IdleHold {
         let mut state = self.gate.lock();
         state.holds = state.holds.saturating_sub(1);
         state.last_activity = Instant::now();
-        self.gate.wake(&mut state);
     }
 }
 
@@ -245,7 +271,7 @@ impl Drop for IdleHold {
 mod tests {
     use std::cell::Cell;
 
-    use tokio::{task, time::timeout};
+    use tokio::{task, time};
 
     use super::*;
 
@@ -267,6 +293,12 @@ mod tests {
         gate.lock().last_activity = Instant::now().checked_sub(idle).unwrap();
     }
 
+    /// Stands in for a chain watcher resync that starts now and succeeds.
+    fn resync(gate: &IdleGate, block_number: u64) {
+        let pause_generation = gate.lock().pause_generation;
+        gate.set_resume_floor(block_number, pause_generation);
+    }
+
     #[tokio::test]
     async fn disabled_gate_never_pauses() {
         let gate = IdleGate::disabled();
@@ -275,7 +307,7 @@ mod tests {
         assert!(!gate.is_paused());
         assert!(!gate.bundling_blocked(0));
         assert!(
-            timeout(Duration::from_millis(20), gate.wait_for_pause())
+            time::timeout(Duration::from_millis(20), gate.wait_for_pause())
                 .await
                 .is_err()
         );
@@ -362,13 +394,13 @@ mod tests {
         assert!(!waiter.is_finished());
 
         assert!(gate.try_pause(|| true, || {}));
-        timeout(WAIT, waiter).await.unwrap().unwrap();
+        time::timeout(WAIT, waiter).await.unwrap().unwrap();
     }
 
     #[tokio::test]
     async fn wait_for_wake_resolves_when_awake() {
         let gate = enabled(Duration::ZERO);
-        timeout(WAIT, gate.wait_for_wake()).await.unwrap();
+        time::timeout(WAIT, gate.wait_for_wake()).await.unwrap();
     }
 
     #[tokio::test]
@@ -384,7 +416,7 @@ mod tests {
         assert!(!waiter.is_finished());
 
         gate.touch();
-        timeout(WAIT, waiter).await.unwrap().unwrap();
+        time::timeout(WAIT, waiter).await.unwrap().unwrap();
         assert!(!gate.is_paused());
     }
 
@@ -401,7 +433,7 @@ mod tests {
         assert!(!waiter.is_finished());
 
         let hold = gate.hold();
-        timeout(WAIT, waiter).await.unwrap().unwrap();
+        time::timeout(WAIT, waiter).await.unwrap().unwrap();
         assert!(!gate.try_pause(|| true, || {}));
 
         drop(hold);
@@ -413,7 +445,7 @@ mod tests {
         let gate = enabled(Duration::ZERO);
         assert!(!gate.bundling_blocked(0));
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10);
         assert!(gate.bundling_blocked(9));
         assert!(!gate.bundling_blocked(10));
         assert!(!gate.bundling_blocked(11));
@@ -431,9 +463,48 @@ mod tests {
         assert!(!gate.is_paused());
         assert!(gate.bundling_blocked(u64::MAX));
 
-        gate.set_resume_floor(20);
+        resync(&gate, 20);
         assert!(gate.bundling_blocked(19));
         assert!(!gate.bundling_blocked(20));
+    }
+
+    #[tokio::test]
+    async fn resync_started_before_a_later_pause_does_not_resume_bundling() {
+        let gate = enabled(Duration::ZERO);
+        assert!(gate.try_pause(|| true, || {}));
+        gate.touch();
+        let first = time::timeout(WAIT, gate.wait_for_wake()).await.unwrap();
+
+        // A chain update handler still running from before the wake pauses again.
+        assert!(gate.try_pause(|| true, || {}));
+        gate.set_resume_floor(1, first);
+        gate.touch();
+        assert!(
+            gate.bundling_blocked(1),
+            "the resync predates the second pause"
+        );
+        time::timeout(WAIT, gate.wait_for_pause()).await.unwrap();
+
+        let second = time::timeout(WAIT, gate.wait_for_wake()).await.unwrap();
+        gate.set_resume_floor(2, second);
+        assert!(gate.bundling_blocked(1));
+        assert!(!gate.bundling_blocked(2));
+    }
+
+    #[test]
+    fn set_held_takes_and_releases_one_hold() {
+        let gate = enabled(Duration::ZERO);
+        let mut slot = None;
+
+        gate.set_held(&mut slot, true);
+        gate.set_held(&mut slot, true);
+        assert_eq!(gate.lock().holds, 1);
+        assert!(!gate.try_pause(|| true, || {}));
+
+        gate.set_held(&mut slot, false);
+        assert!(slot.is_none());
+        assert_eq!(gate.lock().holds, 0);
+        assert!(gate.try_pause(|| true, || {}));
     }
 
     #[test]
@@ -441,14 +512,14 @@ mod tests {
         let gate = enabled(Duration::ZERO);
         assert_eq!(gate.resume_epoch(), 0);
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10);
         assert_eq!(gate.resume_epoch(), 1);
 
         assert!(gate.try_pause(|| true, || {}));
         gate.touch();
         assert_eq!(gate.resume_epoch(), 1, "a wake alone is not a resync");
 
-        gate.set_resume_floor(10);
+        resync(&gate, 10);
         assert_eq!(gate.resume_epoch(), 2);
     }
 
@@ -458,12 +529,12 @@ mod tests {
         assert!(gate.try_pause(|| true, || {}));
         gate.touch();
 
-        timeout(WAIT, gate.wait_for_pause()).await.unwrap();
-        timeout(WAIT, gate.wait_for_wake()).await.unwrap();
+        time::timeout(WAIT, gate.wait_for_pause()).await.unwrap();
+        time::timeout(WAIT, gate.wait_for_wake()).await.unwrap();
 
-        gate.set_resume_floor(1);
+        resync(&gate, 1);
         assert!(
-            timeout(Duration::from_millis(20), gate.wait_for_pause())
+            time::timeout(Duration::from_millis(20), gate.wait_for_pause())
                 .await
                 .is_err()
         );

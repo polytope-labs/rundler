@@ -71,6 +71,10 @@ pub(crate) trait Mempool: Send + Sync {
         perms: UserOperationPermissions,
     ) -> MempoolResult<B256>;
 
+    /// Runs the synchronous checks that reject an operation before any
+    /// validation. `add_operation` runs them too and returns the same error.
+    fn check_admission(&self, op: &UserOperationVariant) -> MempoolResult<()>;
+
     /// Removes a set of operations from the pool.
     fn remove_operations(&self, hashes: &[B256]);
 

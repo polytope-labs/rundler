@@ -757,8 +757,39 @@ impl LocalPoolServerRunner {
         }
     }
 
+    fn admit_op(
+        &self,
+        entry_point: Address,
+        op: &UserOperationVariant,
+    ) -> PoolResult<Arc<dyn Mempool>> {
+        let mempool = self.get_pool(entry_point)?;
+        match mempool.entry_point_version().abi_version() {
+            EntryPointAbiVersion::V0_6 => {
+                if !matches!(op, UserOperationVariant::V0_6(_)) {
+                    return Err(anyhow::anyhow!(
+                        "Invalid user operation version for mempool v0.6 {:?}",
+                        op.uo_type()
+                    )
+                    .into());
+                }
+            }
+            EntryPointAbiVersion::V0_7 => {
+                if !matches!(op, UserOperationVariant::V0_7(_)) {
+                    return Err(anyhow::anyhow!(
+                        "Invalid user operation version for mempool v0.7 {:?}",
+                        op.uo_type()
+                    )
+                    .into());
+                }
+            }
+        }
+        mempool.check_admission(op)?;
+        Ok(Arc::clone(mempool))
+    }
+
     async fn run(mut self, shutdown: GracefulShutdown) {
         let mut chain_updates = self.chain_subscriber.subscribe();
+        let mempools: Arc<[Arc<dyn Mempool>]> = self.mempools.values().cloned().collect();
 
         loop {
             tokio::select! {
@@ -775,8 +806,8 @@ impl LocalPoolServerRunner {
                         // and only receive operations that have not yet been mined.
                         let block_sender = self.block_sender.clone();
                         let idle_gate = self.idle_gate.clone();
-                        let mempools: Vec<_> = self.mempools.values().cloned().collect();
-                        let update_futures : Vec<_> = self.mempools.values().map(|m| {
+                        let mempools = Arc::clone(&mempools);
+                        let update_futures : Vec<_> = mempools.iter().map(|m| {
                             let m = Arc::clone(m);
                             let cu = Arc::clone(&chain_update);
                             async move { m.on_chain_update(&cu).await }
@@ -803,36 +834,26 @@ impl LocalPoolServerRunner {
                         // Async methods
                         // Responses are sent in the spawned task
                         ServerRequestKind::AddOp { entry_point, op, perms, origin } => {
-                            let hold = self.idle_gate.hold();
-                            let fut = |mempool: Arc<dyn Mempool>, response: oneshot::Sender<Result<ServerResponse, PoolError>>| async move {
-                                let resp = 'resp: {
-                                    match mempool.entry_point_version().abi_version() {
-                                        EntryPointAbiVersion::V0_6 => {
-                                            if !matches!(&op, UserOperationVariant::V0_6(_)){
-                                                 break 'resp Err(anyhow::anyhow!("Invalid user operation version for mempool v0.6 {:?}", op.uo_type()).into());
-                                            }
-                                        }
-                                        EntryPointAbiVersion::V0_7 => {
-                                            if !matches!(&op, UserOperationVariant::V0_7(_)){
-                                                break 'resp Err(anyhow::anyhow!("Invalid user operation version for mempool v0.7 {:?}", op.uo_type()).into());
-                                            }
-                                        }
-                                    }
+                            match self.admit_op(entry_point, &op) {
+                                Ok(mempool) => {
+                                    // Taken after admission so a rejected op never wakes the gate.
+                                    let hold = self.idle_gate.hold();
+                                    let response = req.response;
+                                    self.task_spawner.spawn(Box::pin(async move {
+                                        let resp = match mempool.add_operation(origin, op, perms).await {
+                                            Ok(hash) => Ok(ServerResponse::AddOp { hash }),
+                                            Err(e) => Err(e.into()),
+                                        };
+                                        drop(hold);
 
-                                    match mempool.add_operation(origin, op, perms).await {
-                                        Ok(hash) => Ok(ServerResponse::AddOp { hash }),
-                                        Err(e) => Err(e.into()),
-                                    }
-                                };
-                                drop(hold);
-
-                                if let Err(e) = response.send(resp) {
-                                    tracing::error!("Failed to send response: {:?}", e);
+                                        if let Err(e) = response.send(resp) {
+                                            tracing::error!("Failed to send response: {:?}", e);
+                                        }
+                                    }));
+                                    continue;
                                 }
-                            };
-
-                            self.get_pool_and_spawn(entry_point, req.response, fut);
-                            continue;
+                                Err(e) => Err(e),
+                            }
                         },
                         ServerRequestKind::GetStakeStatus { entry_point, address }=> {
                             let fut = |mempool: Arc<dyn Mempool>, response: oneshot::Sender<Result<ServerResponse, PoolError>>| async move {
@@ -1165,6 +1186,7 @@ mod tests {
         mock_pool
             .expect_entry_point_version()
             .returning(|| EntryPointVersion::V0_6);
+        mock_pool.expect_check_admission().returning(|_| Ok(()));
         mock_pool
             .expect_add_operation()
             .returning(move |_, _, _| Ok(hash0));
@@ -1269,12 +1291,14 @@ mod tests {
         pools[0]
             .expect_entry_point_version()
             .returning(|| EntryPointVersion::V0_6);
+        pools[0].expect_check_admission().returning(|_| Ok(()));
         pools[0]
             .expect_add_operation()
             .returning(move |_, _, _| Ok(h0));
         pools[1]
             .expect_entry_point_version()
             .returning(|| EntryPointVersion::V0_7);
+        pools[1].expect_check_admission().returning(|_| Ok(()));
         pools[1]
             .expect_add_operation()
             .returning(move |_, _, _| Ok(h1));
@@ -1317,6 +1341,7 @@ mod tests {
         mock_pool
             .expect_entry_point_version()
             .returning(|| EntryPointVersion::V0_6);
+        mock_pool.expect_check_admission().returning(|_| Ok(()));
         mock_pool.expect_add_operation().returning({
             let gate = gate.clone();
             let seen_during_add = seen_during_add.clone();
@@ -1339,6 +1364,36 @@ mod tests {
         // Awake and held while the add was running.
         assert_eq!(*seen_during_add.lock(), Some((false, false)));
         assert!(gate.try_pause(|| true, || {}));
+    }
+
+    #[tokio::test]
+    async fn test_rejected_add_op_does_not_wake_idle_gate() {
+        let gate = enabled_gate();
+        assert!(gate.try_pause(|| true, || {}));
+
+        let mut mock_pool = MockMempool::new();
+        mock_pool
+            .expect_entry_point_version()
+            .returning(|| EntryPointVersion::V0_6);
+        mock_pool
+            .expect_check_admission()
+            .returning(|_| Err(MempoolError::PaymasterNotAllowed(None)));
+        mock_pool.expect_add_operation().never();
+
+        let ep = ChainSpec::default().entry_point_address_v0_6;
+        let pool: Arc<dyn Mempool> = Arc::new(mock_pool);
+        let state = setup_with_gate(HashMap::from([(ep, pool)]), gate.clone());
+
+        let err = state
+            .handle
+            .add_op(mock_op(), UserOperationPermissions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PoolError::MempoolError(MempoolError::PaymasterNotAllowed(None))
+        ));
+        assert!(gate.is_paused());
     }
 
     #[tokio::test]
