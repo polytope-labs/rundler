@@ -115,6 +115,16 @@ pub enum MempoolError {
     /// Use unsupported EIP
     #[error("{0} is not supported")]
     EIPNotSupported(String),
+    /// The operation has no paymaster, or its paymaster is not on the bundler's allowlist
+    #[error("{}", paymaster_not_allowed_message(.0))]
+    PaymasterNotAllowed(Option<Address>),
+}
+
+fn paymaster_not_allowed_message(paymaster: &Option<Address>) -> String {
+    match paymaster {
+        Some(paymaster) => format!("paymaster {paymaster} is not allowed by this bundler"),
+        None => "user operation has no paymaster; this bundler only accepts operations sponsored by an allowed paymaster".to_string(),
+    }
 }
 
 /// Precheck violation enumeration

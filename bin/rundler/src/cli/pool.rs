@@ -11,7 +11,11 @@
 // You should have received a copy of the GNU General Public License along with Rundler.
 // If not, see https://www.gnu.org/licenses/.
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use alloy_primitives::Address;
 use anyhow::Context;
@@ -94,6 +98,16 @@ pub struct PoolArgs {
         env = "POOL_ALLOWLIST_PATH"
     )]
     pub allowlist_path: Option<String>,
+
+    /// Paymasters allowed to sponsor operations. When set, operations with no paymaster
+    /// or an unlisted one are rejected on send; estimation is unaffected.
+    #[arg(
+        long = "pool.paymaster_allowlist",
+        name = "pool.paymaster_allowlist",
+        env = "POOL_PAYMASTER_ALLOWLIST",
+        value_delimiter = ','
+    )]
+    pub paymaster_allowlist: Vec<Address>,
 
     /// Interval at which the pool polls an Eth node for new blocks
     #[arg(
@@ -268,6 +282,14 @@ impl PoolArgs {
         }
     }
 
+    fn paymaster_allowlist(&self) -> Option<HashSet<Address>> {
+        if self.paymaster_allowlist.is_empty() {
+            None
+        } else {
+            Some(self.paymaster_allowlist.iter().copied().collect())
+        }
+    }
+
     /// Convert the CLI arguments into the arguments for the OP Pool combining
     /// common and op pool specific arguments.
     pub async fn to_args(
@@ -285,8 +307,10 @@ impl PoolArgs {
             Some(allowlist) => Some(get_json_config(allowlist).await?),
             None => None,
         };
+        let paymaster_allowlist = self.paymaster_allowlist();
         tracing::info!("blocklist: {:?}", blocklist);
         tracing::info!("allowlist: {:?}", allowlist);
+        tracing::info!("paymaster allowlist: {paymaster_allowlist:?}");
 
         let mempool_channel_configs = mempool_configs.unwrap_or_default();
 
@@ -305,6 +329,7 @@ impl PoolArgs {
             max_size_of_pool_bytes: self.max_size_in_bytes,
             blocklist: blocklist.clone(),
             allowlist: allowlist.clone(),
+            paymaster_allowlist,
             precheck_settings: common.try_into_with_spec(&chain_spec)?,
             sim_settings: common.try_into()?,
             throttled_entity_mempool_count: self.throttled_entity_mempool_count,
@@ -450,5 +475,21 @@ mod tests {
     fn standalone_pool_rejects_idle_pause() {
         assert!(standalone_idle_gate(&pool_args(&["--pool.idle_pause_enabled"])).is_err());
         assert!(standalone_idle_gate(&pool_args(&[])).is_ok());
+    }
+
+    #[test]
+    fn paymaster_allowlist_defaults_to_none() {
+        assert_eq!(pool_args(&[]).paymaster_allowlist(), None);
+    }
+
+    #[test]
+    fn paymaster_allowlist_parses_comma_list() {
+        let first = Address::random();
+        let second = Address::random();
+        let list = format!("{first},{second}");
+
+        let allowlist = pool_args(&["--pool.paymaster_allowlist", &list]).paymaster_allowlist();
+
+        assert_eq!(allowlist, Some(HashSet::from([first, second])));
     }
 }

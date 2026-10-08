@@ -195,6 +195,12 @@ List of command line options for configuring the Pool.
   - env: _POOL_ALLOWLIST_PATH_
   - This path can either be a local file path or an S3 url. If using an S3 url, Make sure your machine has access to this file.
   - See [here](./architecture/pool.md#allowlistblocklist) for details.
+- `--pool.paymaster_allowlist`: Comma-separated list of paymaster addresses. When set, `eth_sendUserOperation` rejects any UO that has no paymaster or whose paymaster is not on the list (default: `None`)
+  - env: _POOL_PAYMASTER_ALLOWLIST_
+  - Use no spaces between addresses. An empty value fails startup; leave it unset to disable the check.
+  - Applies to the `node`, `backend` and `pool` commands, and to every enabled entry point version.
+  - Separate from `--pool.allowlist_path`, which only exempts addresses from reputation limits and rejects nothing.
+  - See [paymaster allowlist](./architecture/pool.md#paymaster-allowlist) for details.
 - `--pool.chain_poll_interval_millis`: Interval at which the pool polls an Eth node for new blocks (default: `100`)
   - env: _POOL_CHAIN_POLL_INTERVAL_MILLIS_
 - `--pool.chain_sync_max_retries`: The amount of times to retry syncing the chain before giving up and waiting for the next block (default: `5`)

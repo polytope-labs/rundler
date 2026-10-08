@@ -198,6 +198,9 @@ pub struct PoolConfig {
     pub blocklist: Option<HashSet<Address>>,
     /// Operations that are always allowed in the mempool, regardless of reputation
     pub allowlist: Option<HashSet<Address>>,
+    /// When set, only operations sponsored by one of these paymasters are accepted.
+    /// Operations without a paymaster are rejected.
+    pub paymaster_allowlist: Option<HashSet<Address>>,
     /// Settings for precheck validation
     pub precheck_settings: PrecheckSettings,
     /// Settings for simulation validation

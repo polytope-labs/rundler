@@ -36,6 +36,21 @@ Example file:
 
 **Blocklist**: Addresses on this list are always `Banned` in the reputation manager.
 
+### Paymaster Allowlist
+
+With `--pool.paymaster_allowlist` set, the `Pool` only accepts UOs sponsored by a listed paymaster. It checks each UO submitted through `eth_sendUserOperation` before reputation, prechecks and simulation, and rejects it with JSON-RPC error `-32602` (invalid params) when:
+
+- It has no paymaster: `user operation has no paymaster; this bundler only accepts operations sponsored by an allowed paymaster`.
+- Its paymaster is not listed: `paymaster {address} is not allowed by this bundler`.
+
+Notes:
+
+- The same list applies to every enabled entry point version. List the address the UO names as its paymaster, i.e. the `paymaster` field (v0.7+) or the first 20 bytes of `paymasterAndData` (v0.6), which is the proxy address for a proxied paymaster.
+- [Permissions](./rpc.md#user-operation-permissions) do not bypass the check. `trusted` UOs are rejected the same way, and `bundlerSponsorship` UOs are always rejected because they require an empty paymaster.
+- `eth_estimateUserOperationGas` is unaffected.
+- This list is separate from the reputation [allowlist](#allowlistblocklist), which only exempts addresses from reputation limits and rejects nothing.
+- In a distributed deployment, run the same Rundler version for the `pool` or `backend` process and the `rpc` process, since the rejection reaches the RPC task as a new gRPC error variant. With mismatched versions the UO is still rejected, but an older `rpc` cannot decode the error and returns `-32603` instead.
+
 ## Chain Tracking
 
 The `Pool` uses a JSON-RPC provider to track the progression of its chain. The chain tracker notifies the pool of new blocks, mined user operations, and "un-mined" user operations due to chain re-orgs.

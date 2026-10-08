@@ -758,6 +758,7 @@ message MempoolError {
     UseUnsupportedEIP use_unsupported_eip = 20;
     AggregatorError aggregator = 21;
     Invalid7702AuthSignature invalid_7702_auth_signature = 22;
+    PaymasterNotAllowed paymaster_not_allowed = 23;
   }
 }
 
@@ -831,6 +832,11 @@ message TooManyExpectedStorageSlots {
 
 message UseUnsupportedEIP {
   string eip_name = 1;
+}
+
+message PaymasterNotAllowed {
+  // Address of the rejected paymaster, empty if the operation has none
+  bytes paymaster = 1;
 }
 
 // PRECHECK VIOLATIONS

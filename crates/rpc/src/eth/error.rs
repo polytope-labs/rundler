@@ -325,7 +325,8 @@ impl From<MempoolError> for EthRpcError {
             | MempoolError::ExecutionGasLimitEfficiencyTooLow(_, _)
             | MempoolError::TooManyExpectedStorageSlots(_, _)
             | MempoolError::Invalid7702AuthSignature(_)
-            | MempoolError::EIPNotSupported(_) => Self::InvalidParams(value.to_string()),
+            | MempoolError::EIPNotSupported(_)
+            | MempoolError::PaymasterNotAllowed(_) => Self::InvalidParams(value.to_string()),
         }
     }
 }
@@ -582,5 +583,33 @@ impl From<GasEstimationError> for EthRpcError {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paymaster_not_allowed_is_invalid_params() {
+        let paymaster = Address::random();
+        let error: ErrorObjectOwned = EthRpcError::from(PoolError::MempoolError(
+            MempoolError::PaymasterNotAllowed(Some(paymaster)),
+        ))
+        .into();
+
+        assert_eq!(error.code(), INVALID_PARAMS_CODE);
+        assert!(error.message().contains(&paymaster.to_string()));
+    }
+
+    #[test]
+    fn missing_paymaster_is_invalid_params() {
+        let error: ErrorObjectOwned = EthRpcError::from(PoolError::MempoolError(
+            MempoolError::PaymasterNotAllowed(None),
+        ))
+        .into();
+
+        assert_eq!(error.code(), INVALID_PARAMS_CODE);
+        assert!(error.message().contains("no paymaster"));
     }
 }
