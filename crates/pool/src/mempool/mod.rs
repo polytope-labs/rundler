@@ -71,6 +71,10 @@ pub(crate) trait Mempool: Send + Sync {
         perms: UserOperationPermissions,
     ) -> MempoolResult<B256>;
 
+    /// Runs the synchronous checks that reject an operation before any
+    /// validation. `add_operation` runs them too and returns the same error.
+    fn check_admission(&self, op: &UserOperationVariant) -> MempoolResult<()>;
+
     /// Removes a set of operations from the pool.
     fn remove_operations(&self, hashes: &[B256]);
 
@@ -168,6 +172,14 @@ pub(crate) trait Mempool: Send + Sync {
 
     /// Get extended status for a user operation.
     fn get_operation_status(&self, hash: B256) -> Option<PoolOperationStatus>;
+
+    /// Returns true when the pool holds no pending operations and no mined
+    /// operations that a reorg could return to it.
+    fn is_quiescent(&self) -> bool;
+
+    /// Called when chain polling pauses, to drop state that the paused chain
+    /// watcher can no longer keep current.
+    fn on_idle_pause(&self);
 }
 
 /// Config for the mempool
@@ -190,6 +202,9 @@ pub struct PoolConfig {
     pub blocklist: Option<HashSet<Address>>,
     /// Operations that are always allowed in the mempool, regardless of reputation
     pub allowlist: Option<HashSet<Address>>,
+    /// When set, only operations sponsored by one of these paymasters are accepted.
+    /// Operations without a paymaster are rejected.
+    pub paymaster_allowlist: Option<HashSet<Address>>,
     /// Settings for precheck validation
     pub precheck_settings: PrecheckSettings,
     /// Settings for simulation validation

@@ -183,6 +183,9 @@ where
     #[instrument(skip_all)]
     pub(crate) async fn reset_confirmed_balances(&self) -> MempoolResult<()> {
         let paymaster_addresses = self.paymaster_addresses();
+        if paymaster_addresses.is_empty() {
+            return Ok(());
+        }
 
         let balances = self
             .entry_point
@@ -716,6 +719,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(balance_0.confirmed_balance, U256::from(50));
+    }
+
+    #[tokio::test]
+    async fn test_reset_balances_without_paymasters_skips_provider() {
+        let mut entrypoint = MockEntryPointV0_6::new();
+        entrypoint.expect_get_balances().never();
+        let tracker =
+            PaymasterTracker::new(entrypoint, PaymasterConfig::new(U256::ZERO, 0, true, 2));
+
+        tracker.reset_confirmed_balances().await.unwrap();
     }
 
     #[tokio::test]

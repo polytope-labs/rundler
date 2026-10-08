@@ -810,6 +810,10 @@ where
         }
     }
 
+    pub(crate) fn is_quiescent(&self) -> bool {
+        self.by_hash.is_empty() && self.mined_at_block_number_by_hash.is_empty()
+    }
+
     pub(crate) fn clear(&mut self) {
         self.by_hash.clear();
         self.by_id.clear();
@@ -1555,6 +1559,37 @@ mod tests {
         assert!(pool.by_hash.is_empty());
         assert!(pool.by_id.is_empty());
         assert!(pool.best.is_empty());
+    }
+
+    #[test]
+    fn quiescent_until_mined_ops_are_forgotten() {
+        let mut pool = pool();
+        assert!(pool.is_quiescent());
+
+        let sender = Address::random();
+        let op = create_op(sender, 0, 1);
+        let hash = pool.add_operation(op, 0, 0).unwrap();
+        assert!(!pool.is_quiescent());
+
+        let mined_op = MinedOp {
+            paymaster: None,
+            actual_gas_cost: U256::ZERO,
+            hash,
+            entry_point: pool.config.entry_point,
+            sender,
+            nonce: U256::ZERO,
+            success: true,
+            actual_gas_used: U256::ZERO,
+        };
+        pool.mine_operation(&mined_op, 1);
+        assert!(pool.by_hash.is_empty());
+        assert!(!pool.is_quiescent());
+
+        pool.forget_mined_operations_before_block(1);
+        assert!(!pool.is_quiescent());
+
+        pool.forget_mined_operations_before_block(2);
+        assert!(pool.is_quiescent());
     }
 
     #[test]

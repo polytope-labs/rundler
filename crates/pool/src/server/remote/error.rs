@@ -36,15 +36,16 @@ use super::protos::{
     MempoolError as ProtoMempoolError, MultipleRolesViolation, NotStaked,
     OperationAlreadyKnownError, OperationDropTooSoon, OperationRevert, OutOfGas, OverMaxCost,
     PanicRevert, PaymasterBalanceTooLow, PaymasterDepositTooLow, PaymasterIsNotContract,
-    PreVerificationGasTooLow, PrecheckViolationError as ProtoPrecheckViolationError,
-    ReplacementUnderpricedError, SenderAddressUsedAsAlternateEntity, SenderFundsTooLow,
-    SenderIsNotContractAndNoInitCode, SimulationViolationError as ProtoSimulationViolationError,
-    TooManyExpectedStorageSlots, TotalGasLimitTooHigh, UnintendedRevert,
-    UnintendedRevertWithMessage, UnknownEntryPointError, UnknownRevert, UnstakedPaymasterContext,
-    UseUnsupportedEip, UsedForbiddenOpcode, UsedForbiddenPrecompile,
-    ValidationRevert as ProtoValidationRevert, VerificationGasLimitBufferTooLow,
-    VerificationGasLimitEfficiencyTooLow, VerificationGasLimitTooHigh, WrongNumberOfPhases,
-    mempool_error, precheck_violation_error, simulation_violation_error, validation_revert,
+    PaymasterNotAllowed, PreVerificationGasTooLow,
+    PrecheckViolationError as ProtoPrecheckViolationError, ReplacementUnderpricedError,
+    SenderAddressUsedAsAlternateEntity, SenderFundsTooLow, SenderIsNotContractAndNoInitCode,
+    SimulationViolationError as ProtoSimulationViolationError, TooManyExpectedStorageSlots,
+    TotalGasLimitTooHigh, UnintendedRevert, UnintendedRevertWithMessage, UnknownEntryPointError,
+    UnknownRevert, UnstakedPaymasterContext, UseUnsupportedEip, UsedForbiddenOpcode,
+    UsedForbiddenPrecompile, ValidationRevert as ProtoValidationRevert,
+    VerificationGasLimitBufferTooLow, VerificationGasLimitEfficiencyTooLow,
+    VerificationGasLimitTooHigh, WrongNumberOfPhases, mempool_error, precheck_violation_error,
+    simulation_violation_error, validation_revert,
 };
 
 impl TryFrom<ProtoMempoolError> for PoolError {
@@ -146,6 +147,13 @@ impl TryFrom<ProtoMempoolError> for MempoolError {
             }
             Some(mempool_error::Error::Invalid7702AuthSignature(e)) => {
                 MempoolError::Invalid7702AuthSignature(e.reason)
+            }
+            Some(mempool_error::Error::PaymasterNotAllowed(e)) => {
+                MempoolError::PaymasterNotAllowed(if e.paymaster.is_empty() {
+                    None
+                } else {
+                    Some(from_bytes(&e.paymaster)?)
+                })
             }
             None => bail!("unknown proto mempool error"),
         })
@@ -279,6 +287,13 @@ impl From<MempoolError> for ProtoMempoolError {
             MempoolError::Invalid7702AuthSignature(msg) => ProtoMempoolError {
                 error: Some(mempool_error::Error::Invalid7702AuthSignature(
                     Invalid7702AuthSignature { reason: msg },
+                )),
+            },
+            MempoolError::PaymasterNotAllowed(paymaster) => ProtoMempoolError {
+                error: Some(mempool_error::Error::PaymasterNotAllowed(
+                    PaymasterNotAllowed {
+                        paymaster: paymaster.map_or(vec![], |addr| addr.to_proto_bytes()),
+                    },
                 )),
             },
         }
@@ -1037,7 +1052,7 @@ impl TryFrom<ProtoValidationRevert> for ValidationRevert {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::U256;
+    use alloy_primitives::{Address, U256};
 
     use super::*;
 
@@ -1082,6 +1097,29 @@ mod tests {
                 rundler_types::EntityType::Aggregator,
                 None,
             )) => {}
+            _ => panic!("wrong error type"),
+        }
+    }
+
+    #[test]
+    fn test_paymaster_not_allowed_error() {
+        let paymaster = Address::random();
+        let error = MempoolError::PaymasterNotAllowed(Some(paymaster));
+        let proto_error: ProtoMempoolError = error.into();
+        let error2 = proto_error.try_into().unwrap();
+        match error2 {
+            MempoolError::PaymasterNotAllowed(Some(p)) => assert_eq!(p, paymaster),
+            _ => panic!("wrong error type"),
+        }
+    }
+
+    #[test]
+    fn test_paymaster_not_allowed_error_without_paymaster() {
+        let error = MempoolError::PaymasterNotAllowed(None);
+        let proto_error: ProtoMempoolError = error.into();
+        let error2 = proto_error.try_into().unwrap();
+        match error2 {
+            MempoolError::PaymasterNotAllowed(None) => {}
             _ => panic!("wrong error type"),
         }
     }

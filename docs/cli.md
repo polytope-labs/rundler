@@ -195,6 +195,12 @@ List of command line options for configuring the Pool.
   - env: _POOL_ALLOWLIST_PATH_
   - This path can either be a local file path or an S3 url. If using an S3 url, Make sure your machine has access to this file.
   - See [here](./architecture/pool.md#allowlistblocklist) for details.
+- `--pool.paymaster_allowlist`: Comma-separated list of paymaster addresses. When set, `eth_sendUserOperation` rejects any UO that has no paymaster or whose paymaster is not on the list (default: `None`)
+  - env: _POOL_PAYMASTER_ALLOWLIST_
+  - Use no spaces between addresses. An empty value fails startup; leave it unset to disable the check.
+  - Applies to the `node`, `backend` and `pool` commands, and to every enabled entry point version.
+  - Separate from `--pool.allowlist_path`, which only exempts addresses from reputation limits and rejects nothing.
+  - See [paymaster allowlist](./architecture/pool.md#paymaster-allowlist) for details.
 - `--pool.chain_poll_interval_millis`: Interval at which the pool polls an Eth node for new blocks (default: `100`)
   - env: _POOL_CHAIN_POLL_INTERVAL_MILLIS_
 - `--pool.chain_sync_max_retries`: The amount of times to retry syncing the chain before giving up and waiting for the next block (default: `5`)
@@ -222,6 +228,15 @@ List of command line options for configuring the Pool.
   - env: _POOL_SUSPECT_RPC_BACKOFF_INITIAL_SECS_
 - `--pool.suspect_rpc_backoff_max_secs`: Maximum delay in seconds between suspect isolation attempts (default: `600`)
   - env: _POOL_SUSPECT_RPC_BACKOFF_MAX_SECS_
+- `--pool.idle_pause_enabled`: Stop polling the node while nothing is pending or in flight (default: `false`)
+  - env: _POOL_IDLE_PAUSE_ENABLED_
+  - Only for the `node` and `backend` commands, which run the pool and builder in one process. The standalone `pool` command refuses to start with it set.
+  - Gas estimation and receipt queries keep working while paused, because they query the node directly.
+  - With `--signer.enable_kms_funding` set, the funding task still reads the funding key's balance every 60 seconds while paused.
+  - An operation that can never be bundled keeps the pool from going idle, so polling does not pause unless `--pool.max_time_in_pool_secs` is set to drop it.
+  - See [idle pause](./architecture/pool.md#idle-pause) for details.
+- `--pool.idle_pause_grace_millis`: How long the pool and builder must stay idle before polling pauses, in milliseconds (default: `60000`)
+  - env: _POOL_IDLE_PAUSE_GRACE_MILLIS_
 
 ## Builder Options
 

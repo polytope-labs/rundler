@@ -36,6 +36,21 @@ Example file:
 
 **Blocklist**: Addresses on this list are always `Banned` in the reputation manager.
 
+### Paymaster Allowlist
+
+With `--pool.paymaster_allowlist` set, the `Pool` only accepts UOs sponsored by a listed paymaster. It checks each UO submitted through `eth_sendUserOperation` before reputation, prechecks and simulation, and rejects it with JSON-RPC error `-32602` (invalid params) when:
+
+- It has no paymaster: `user operation has no paymaster; this bundler only accepts operations sponsored by an allowed paymaster`.
+- Its paymaster is not listed: `paymaster {address} is not allowed by this bundler`.
+
+Notes:
+
+- The same list applies to every enabled entry point version. List the address the UO names as its paymaster, i.e. the `paymaster` field (v0.7+) or the first 20 bytes of `paymasterAndData` (v0.6), which is the proxy address for a proxied paymaster.
+- [Permissions](./rpc.md#user-operation-permissions) do not bypass the check. `trusted` UOs are rejected the same way, and `bundlerSponsorship` UOs are always rejected because they require an empty paymaster.
+- `eth_estimateUserOperationGas` is unaffected.
+- This list is separate from the reputation [allowlist](#allowlistblocklist), which only exempts addresses from reputation limits and rejects nothing.
+- In a distributed deployment, run the same Rundler version for the `pool` or `backend` process and the `rpc` process, since the rejection reaches the RPC task as a new gRPC error variant. With mismatched versions the UO is still rejected, but an older `rpc` cannot decode the error and returns `-32603` instead.
+
 ## Chain Tracking
 
 The `Pool` uses a JSON-RPC provider to track the progression of its chain. The chain tracker notifies the pool of new blocks, mined user operations, and "un-mined" user operations due to chain re-orgs.
@@ -43,6 +58,30 @@ The `Pool` uses a JSON-RPC provider to track the progression of its chain. The c
 Upon receiving a chain update event, the `Pool` will update its internal state by removing any mined user operations (and placing them in its cache), and by replacing any un-mined user operations (from its cache).
 
 The `Pool`'s cache depth is configurable, if a re-org occurs that is deeper than the cache, UOs will be unable to be returned to the pool.
+
+### Idle Pause
+
+With `--pool.idle_pause_enabled`, the chain tracker stops polling the node while the bundler is idle. The pool and builder share an in-process idle gate, so this only works with the `node` and `backend` commands.
+
+The tracker pauses after a chain update once all of these hold:
+
+- No mempool has pending UOs, or mined UOs that a re-org within the cache depth could return.
+- Nothing holds the gate. The builder holds it while work is in flight, see [triggers](./builder.md#triggers).
+- `--pool.idle_pause_grace_millis` has passed since the last activity.
+
+Any of these wakes it:
+
+- An `AddOp`, i.e. a UO arriving through `eth_sendUserOperation`, unless the [paymaster allowlist](#paymaster-allowlist) rejects it.
+- A sponsored delegation queued by the builder.
+- A manual `debug_bundler_sendBundleNow`.
+
+On wake the tracker resyncs from the current head only, without loading the blocks it missed while paused. The pool held no UOs at pause, so none depend on those blocks, but paymaster deposits and withdrawals in them go unseen. The pool therefore clears its cached paymaster balances and liabilities at pause, and on the resync it refetches every cached paymaster balance, as after a re-org deeper than the cache.
+
+Metrics:
+
+- `op_pool_chain_idle_paused`: gauge, `1` while paused.
+- `op_pool_chain_idle_pauses`: count of pauses.
+- `op_pool_chain_idle_resyncs`: count of resyncs from head after a pause.
 
 ## Mempool Config
 

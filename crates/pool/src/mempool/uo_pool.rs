@@ -557,6 +557,8 @@ where
         mut op: UserOperationVariant,
         perms: UserOperationPermissions,
     ) -> MempoolResult<B256> {
+        self.check_admission(&op)?;
+
         // Initial state checks
         let to_replace = {
             let state = self.state.read();
@@ -835,6 +837,10 @@ where
         Ok(hash)
     }
 
+    fn check_admission(&self, op: &UserOperationVariant) -> MempoolResult<()> {
+        check_paymaster_allowed(self.config.paymaster_allowlist.as_ref(), op)
+    }
+
     fn remove_operations(&self, hashes: &[B256]) {
         self.remove_operations_with_reason(hashes, OpRemovalReason::Requested);
     }
@@ -1035,6 +1041,34 @@ where
     fn get_operation_status(&self, hash: B256) -> Option<PoolOperationStatus> {
         self.state.read().pool.get_operation_status(hash)
     }
+
+    fn is_quiescent(&self) -> bool {
+        self.state.read().pool.is_quiescent()
+    }
+
+    // A paused chain watcher misses Deposited events, so a top-up made while
+    // paused would leave a stale cached balance behind. Expiry and entity
+    // removal drop ops without releasing their paymaster liability, so with no
+    // ops left every remaining liability is stale.
+    fn on_idle_pause(&self) {
+        let pool_quiescent = self.state.read().pool.is_quiescent();
+        if pool_quiescent {
+            self.paymaster.clear();
+        }
+    }
+}
+
+fn check_paymaster_allowed(
+    allowlist: Option<&HashSet<Address>>,
+    op: &UserOperationVariant,
+) -> MempoolResult<()> {
+    let Some(allowlist) = allowlist else {
+        return Ok(());
+    };
+    match op.paymaster() {
+        Some(paymaster) if allowlist.contains(&paymaster) => Ok(()),
+        paymaster => Err(MempoolError::PaymasterNotAllowed(paymaster)),
+    }
 }
 
 // Type erasure for UoPool providers
@@ -1137,6 +1171,7 @@ mod tests {
         da::DAGasData,
         pool::{PrecheckViolation, SimulationViolation},
         v0_6::{UserOperationBuilder, UserOperationRequiredFields},
+        v0_7,
     };
 
     use super::*;
@@ -1919,6 +1954,240 @@ mod tests {
         assert!(matches!(ret, MempoolError::PaymasterBalanceTooLow(_, _)));
     }
 
+    fn paymaster_allowlist_config(paymasters: &[Address]) -> PoolConfig {
+        PoolConfig {
+            paymaster_allowlist: Some(paymasters.iter().copied().collect()),
+            ..default_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn paymaster_allowlist_rejects_unlisted_paymaster() {
+        let paymaster = Address::random();
+        let op = create_op(Address::random(), 0, 1, Some(paymaster));
+        // A blocklisted paymaster fails reputation and the entry point mock has no
+        // balance_of expectation, so the allowlist check must run before both.
+        let pool = create_pool_with_config(
+            PoolConfig {
+                blocklist: Some(HashSet::from([paymaster])),
+                ..paymaster_allowlist_config(&[Address::random()])
+            },
+            vec![op.clone()],
+        );
+
+        assert!(matches!(
+            pool.check_admission(&op.op),
+            Err(MempoolError::PaymasterNotAllowed(Some(p))) if p == paymaster
+        ));
+        let ret = pool
+            .add_operation(OperationOrigin::Local, op.op, default_perms())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(ret, MempoolError::PaymasterNotAllowed(Some(p)) if p == paymaster));
+        assert!(pool.best_operations(1, None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paymaster_allowlist_rejects_op_without_paymaster() {
+        let op = create_op(Address::random(), 0, 1, None);
+        let pool = create_pool_with_config(
+            paymaster_allowlist_config(&[Address::random()]),
+            vec![op.clone()],
+        );
+
+        let ret = pool
+            .add_operation(OperationOrigin::Local, op.op, default_perms())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(ret, MempoolError::PaymasterNotAllowed(None)));
+        assert!(pool.best_operations(1, None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn paymaster_allowlist_accepts_listed_paymaster() {
+        let paymaster = Address::random();
+        let op = create_op(Address::random(), 0, 1, Some(paymaster));
+        let mut entrypoint = MockEntryPointV0_6::new();
+        entrypoint
+            .expect_balance_of()
+            .returning(|_, _| Ok(U256::from(1000)));
+        let pool = create_pool_with_entry_point_config(
+            paymaster_allowlist_config(&[paymaster]),
+            vec![op.clone()],
+            entrypoint,
+            MempoolConfig::default(),
+        );
+
+        pool.check_admission(&op.op).unwrap();
+        pool.add_operation(OperationOrigin::Local, op.op.clone(), default_perms())
+            .await
+            .unwrap();
+
+        check_ops(pool.best_operations(1, None).unwrap(), vec![op.op]);
+    }
+
+    #[tokio::test]
+    async fn paymaster_allowlist_unset_accepts_any_op() {
+        let no_paymaster = create_op(Address::random(), 0, 1, None);
+        let with_paymaster = create_op(Address::random(), 0, 1, Some(Address::random()));
+        let mut entrypoint = MockEntryPointV0_6::new();
+        entrypoint
+            .expect_balance_of()
+            .returning(|_, _| Ok(U256::from(1000)));
+        let pool = create_pool_with_entry_point(
+            vec![no_paymaster.clone(), with_paymaster.clone()],
+            entrypoint,
+        );
+
+        for op in [&no_paymaster, &with_paymaster] {
+            pool.add_operation(OperationOrigin::Local, op.op.clone(), default_perms())
+                .await
+                .unwrap();
+        }
+
+        check_ops_unordered(
+            &pool.best_operations(2, None).unwrap(),
+            &[no_paymaster.op, with_paymaster.op],
+        );
+    }
+
+    #[test]
+    fn check_paymaster_allowed_v0_7() {
+        let chain_spec = ChainSpec::default();
+        let v0_7_op = |paymaster: Option<Address>| -> UserOperationVariant {
+            let builder = v0_7::UserOperationBuilder::new(
+                &chain_spec,
+                EntryPointVersion::V0_7,
+                v0_7::UserOperationRequiredFields {
+                    sender: Address::random(),
+                    nonce: U256::ZERO,
+                    call_data: Bytes::new(),
+                    call_gas_limit: 100_000,
+                    verification_gas_limit: 100_000,
+                    pre_verification_gas: 50_000,
+                    max_priority_fee_per_gas: 1,
+                    max_fee_per_gas: 1,
+                    signature: Bytes::new(),
+                },
+            );
+            match paymaster {
+                Some(paymaster) => builder.paymaster(paymaster, 50_000, 50_000, Bytes::new()),
+                None => builder,
+            }
+            .build()
+            .into()
+        };
+        let listed = Address::random();
+        let unlisted = Address::random();
+        let allowlist = HashSet::from([listed]);
+
+        assert!(check_paymaster_allowed(Some(&allowlist), &v0_7_op(Some(listed))).is_ok());
+        assert!(matches!(
+            check_paymaster_allowed(Some(&allowlist), &v0_7_op(Some(unlisted))),
+            Err(MempoolError::PaymasterNotAllowed(Some(p))) if p == unlisted
+        ));
+        assert!(matches!(
+            check_paymaster_allowed(Some(&allowlist), &v0_7_op(None)),
+            Err(MempoolError::PaymasterNotAllowed(None))
+        ));
+        assert!(check_paymaster_allowed(None, &v0_7_op(None)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn on_idle_pause_clears_paymaster_balances_only_without_pending_ops() {
+        let paymaster = Address::random();
+        let mut entrypoint = MockEntryPointV0_6::new();
+        entrypoint
+            .expect_balance_of()
+            .returning(|_, _| Ok(U256::from(1000)));
+
+        let (pool, uos) = create_pool_with_entrypoint_insert_ops(
+            vec![create_op(Address::random(), 0, 1, Some(paymaster))],
+            entrypoint,
+        )
+        .await;
+        assert!(!pool.is_quiescent());
+        assert_eq!(pool.dump_paymaster_balances().len(), 1);
+
+        pool.on_idle_pause();
+        assert_eq!(pool.dump_paymaster_balances().len(), 1);
+
+        pool.remove_operations(&[uos[0].hash()]);
+        assert!(pool.is_quiescent());
+        assert_eq!(pool.dump_paymaster_balances().len(), 1);
+
+        pool.on_idle_pause();
+        assert!(pool.dump_paymaster_balances().is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_idle_pause_drops_liability_left_by_an_expired_op() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let paymaster = Address::random();
+        let deposit = Arc::new(AtomicU64::new(1000));
+        let mut entrypoint = MockEntryPointV0_6::new();
+        let balance = deposit.clone();
+        entrypoint
+            .expect_balance_of()
+            .returning(move |_, _| Ok(U256::from(balance.load(Ordering::Relaxed))));
+
+        let paymaster_op = |sender| {
+            create_op_from_required(UserOperationRequiredFields {
+                sender,
+                call_gas_limit: 10,
+                verification_gas_limit: 10,
+                pre_verification_gas: 10,
+                max_fee_per_gas: 1,
+                paymaster_and_data: paymaster.to_vec().into(),
+                ..Default::default()
+            })
+        };
+        let mut op = paymaster_op(Address::random());
+        op.valid_time_range = ValidTimeRange {
+            valid_after: 0.into(),
+            valid_until: 10.into(),
+        };
+
+        let (pool, uos) = create_pool_with_entrypoint_insert_ops(vec![op], entrypoint).await;
+        assert!(!pool.is_quiescent());
+        assert_eq!(
+            pool.dump_paymaster_balances()[0].pending_balance,
+            U256::from(950)
+        );
+
+        pool.on_chain_update(&ChainUpdate {
+            latest_block_timestamp: 11.into(),
+            ..ChainUpdate::default()
+        })
+        .await;
+        assert!(pool.get_user_operation_by_hash(uos[0].hash()).is_none());
+        assert!(pool.is_quiescent());
+        assert_eq!(
+            pool.dump_paymaster_balances()[0].pending_balance,
+            U256::from(950)
+        );
+
+        pool.on_idle_pause();
+        assert!(pool.dump_paymaster_balances().is_empty());
+
+        deposit.store(2000, Ordering::Relaxed);
+        pool.add_operation(
+            OperationOrigin::Local,
+            paymaster_op(Address::random()).op,
+            default_perms(),
+        )
+        .await
+        .unwrap();
+
+        let balances = pool.dump_paymaster_balances();
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].confirmed_balance, U256::from(2000));
+        assert_eq!(balances[0].pending_balance, U256::from(1950));
+    }
+
     #[tokio::test]
     async fn precheck_error() {
         let sender = Address::random();
@@ -2678,6 +2947,7 @@ mod tests {
             max_size_of_pool_bytes: 10000,
             blocklist: None,
             allowlist: None,
+            paymaster_allowlist: None,
             precheck_settings: PrecheckSettings::default(),
             sim_settings: SimulationSettings::default(),
             mempool_channel_configs: HashMap::new(),

@@ -20,7 +20,7 @@ use rundler_sim::{
     PrecheckerImpl, Simulator,
     simulation::{self, UnsafeSimulator},
 };
-use rundler_task::TaskSpawnerExt;
+use rundler_task::{TaskSpawnerExt, idle::IdleGate};
 use rundler_types::{EntryPointAbiVersion, UserOperation, UserOperationVariant, chain::ChainSpec};
 use rundler_utils::emit::WithEntryPoint;
 use tokio::sync::broadcast;
@@ -64,6 +64,7 @@ pub struct PoolTask<P> {
     event_sender: broadcast::Sender<WithEntryPoint<OpPoolEvent>>,
     pool_builder: LocalPoolBuilder,
     providers: P,
+    idle_gate: IdleGate,
 }
 
 impl<P> PoolTask<P> {
@@ -73,12 +74,14 @@ impl<P> PoolTask<P> {
         event_sender: broadcast::Sender<WithEntryPoint<OpPoolEvent>>,
         pool_builder: LocalPoolBuilder,
         providers: P,
+        idle_gate: IdleGate,
     ) -> Self {
         Self {
             args,
             event_sender,
             pool_builder,
             providers,
+            idle_gate,
         }
     }
 }
@@ -114,8 +117,9 @@ where
         let chain = Chain::new(self.providers.evm().clone(), chain_settings);
         let chain_subscriber = chain.subscriber();
 
+        let idle_gate = self.idle_gate.clone();
         task_spawner.spawn_critical_with_graceful_shutdown_signal("chain watcher", |shutdown| {
-            chain.watch(shutdown)
+            chain.watch(shutdown, idle_gate)
         });
 
         // create mempools
@@ -158,7 +162,7 @@ where
             "local pool server",
             |shutdown| {
                 self.pool_builder
-                    .run(ts_box, mempools, chain_subscriber, shutdown)
+                    .run(ts_box, mempools, chain_subscriber, self.idle_gate, shutdown)
             },
         );
 

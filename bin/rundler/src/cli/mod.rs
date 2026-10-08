@@ -143,7 +143,7 @@ pub async fn run() -> anyhow::Result<()> {
             backend::spawn_tasks(
                 task_spawner.clone(),
                 cs,
-                args,
+                *args,
                 opt.common,
                 providers,
                 mempool_configs,
@@ -208,7 +208,7 @@ enum Command {
     /// Runs both Pool and Builder in a single process with gRPC endpoints exposed.
     /// Useful for running a single-chain backend that a gateway can connect to.
     #[command(name = "backend")]
-    Backend(BackendCliArgs),
+    Backend(Box<BackendCliArgs>),
 }
 
 /// CLI common options

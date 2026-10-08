@@ -22,7 +22,10 @@ use alloy_primitives::B256;
 use anyhow::Context;
 use rundler_provider::{EvmProvider, FeeEstimator, TransactionRequest};
 use rundler_signer::SignerManager;
-use rundler_task::GracefulShutdown;
+use rundler_task::{
+    GracefulShutdown,
+    idle::{IdleGate, IdleHold},
+};
 use rundler_types::{
     GasFees,
     authorization::Eip7702Auth,
@@ -145,6 +148,9 @@ pub(crate) struct DelegationSenderTask<E, F> {
     queue: VecDeque<(DelegationId, Eip7702Auth, Option<u64>)>,
     /// Delegations that have been submitted and are waiting to mine.
     pending: HashSet<DelegationId>,
+    /// Batches submitted and not yet completed. A retried delegation can be
+    /// in more than one, so this is counted apart from `pending`.
+    in_flight: usize,
     /// Delegations that have mined, with their (tx_hash, block_number).
     /// Entries are pruned after MINED_RETENTION_BLOCKS.
     mined: HashMap<DelegationId, (B256, u64)>,
@@ -156,6 +162,9 @@ pub(crate) struct DelegationSenderTask<E, F> {
     provider: E,
     fee_estimator: F,
     settings: Settings,
+    idle_gate: IdleGate,
+    /// Held while any delegation is queued or a batch awaits its mined receipt.
+    idle_hold: Option<IdleHold>,
 }
 
 impl<E, F> DelegationSenderTask<E, F> {
@@ -177,6 +186,39 @@ impl<E, F> DelegationSenderTask<E, F> {
             }
         }
     }
+
+    /// Queues a delegation for submission and records it as pending.
+    fn enqueue(&mut self, auth: Eip7702Auth, valid_until: Option<u64>) -> DelegationId {
+        self.idle_gate.touch();
+        let id = DelegationId::from_auth(&auth);
+        self.pending.insert(id.clone());
+        self.queue.push_back((id.clone(), auth, valid_until));
+        id
+    }
+
+    /// Moves up to `max_size` queued delegations into a batch counted as in flight.
+    fn start_batch(&mut self, max_size: usize) -> Vec<(DelegationId, Eip7702Auth, Option<u64>)> {
+        let size = self.queue.len().min(max_size);
+        self.in_flight += 1;
+        self.queue.drain(..size).collect()
+    }
+
+    fn handle_completion(&mut self, event: CompletionEvent) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        for id in &event.ids {
+            self.pending.remove(id);
+        }
+        if let Ok(tx_hash) = event.result {
+            for id in event.ids {
+                self.mined.insert(id, (tx_hash, self.current_block));
+            }
+        }
+    }
+
+    fn update_idle_hold(&mut self) {
+        let busy = !self.queue.is_empty() || self.in_flight > 0;
+        self.idle_gate.set_held(&mut self.idle_hold, busy);
+    }
 }
 
 impl<E, F> DelegationSenderTask<E, F>
@@ -191,6 +233,7 @@ where
         fee_estimator: F,
         settings: Settings,
         heads_tx: broadcast::Sender<Arc<NewHead>>,
+        idle_gate: IdleGate,
     ) -> (Self, DelegationSenderHandle) {
         let (action_tx, action_rx) = mpsc::channel(1024);
         let (completion_tx, completion_rx) = mpsc::channel(1024);
@@ -200,6 +243,7 @@ where
             completion_rx,
             queue: VecDeque::new(),
             pending: HashSet::new(),
+            in_flight: 0,
             mined: HashMap::new(),
             current_block: 0,
             heads_tx,
@@ -207,6 +251,8 @@ where
             provider,
             fee_estimator,
             settings,
+            idle_gate,
+            idle_hold: None,
         };
         let handle = DelegationSenderHandle { action_tx };
         (task, handle)
@@ -235,9 +281,7 @@ where
                 .saturating_sub(DELEGATION_BASE_GAS)
                 .saturating_sub(DELEGATION_GAS_BUFFER))
                 / DELEGATION_GAS_PER_AUTH) as usize;
-            let batch_size = self.queue.len().min(max_auths.max(1));
-            let batch: Vec<(DelegationId, Eip7702Auth, Option<u64>)> =
-                self.queue.drain(..batch_size).collect();
+            let batch = self.start_batch(max_auths.max(1));
             let ids: Vec<DelegationId> = batch.iter().map(|(id, _, _)| id.clone()).collect();
             let auths: Vec<Eip7702Auth> = batch.into_iter().map(|(_, auth, _)| auth).collect();
 
@@ -290,23 +334,14 @@ where
                 }
 
                 Some(event) = self.completion_rx.recv() => {
-                    for id in &event.ids {
-                        self.pending.remove(id);
-                    }
-                    if let Ok(tx_hash) = event.result {
-                        for id in event.ids {
-                            self.mined.insert(id, (tx_hash, self.current_block));
-                        }
-                    }
+                    self.handle_completion(event);
                 }
 
                 Some(action) = self.action_rx.recv() => {
                     match action {
                         DelegationSenderAction::Send { auth, valid_until, responder } => {
-                            let id = DelegationId::from_auth(&auth);
-                            self.pending.insert(id.clone());
-                            let _ = responder.send(id.clone());
-                            self.queue.push_back((id, auth, valid_until));
+                            let id = self.enqueue(auth, valid_until);
+                            let _ = responder.send(id);
                             self.try_drain_queue();
                         }
 
@@ -323,6 +358,8 @@ where
                     }
                 }
             }
+
+            self.update_idle_hold();
         }
     }
 }
@@ -515,7 +552,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::Address;
+    use std::time::Duration;
+
+    use alloy_primitives::{Address, U256};
+    use rundler_signer::{CachedAccountState, Result as SignerResult, SignerLease};
+    use rundler_task::idle::IdleSettings;
     use rundler_types::authorization::Eip7702Auth;
 
     use super::*;
@@ -638,6 +679,149 @@ mod tests {
         assert!(!task.pending.contains(&id_exp2));
         assert!(task.pending.contains(&id_ok));
         assert!(task.pending.contains(&id_none));
+    }
+
+    struct NoSigners;
+
+    #[async_trait::async_trait]
+    impl SignerManager for NoSigners {
+        fn addresses(&self) -> Vec<Address> {
+            vec![]
+        }
+
+        fn available(&self) -> usize {
+            0
+        }
+
+        async fn wait_for_available(&self, _: usize) -> SignerResult<()> {
+            Ok(())
+        }
+
+        fn lease_signer(&self) -> Option<SignerLease> {
+            None
+        }
+
+        fn lease_signer_by_address(&self, _: &Address) -> Option<SignerLease> {
+            None
+        }
+
+        fn return_lease(&self, _: SignerLease) {}
+
+        fn cached_account_state(&self, _: Address) -> Option<CachedAccountState> {
+            None
+        }
+
+        fn set_account_state(&self, _: Address, _: u64, _: U256) {}
+
+        fn invalidate_account_state(&self, _: Address) {}
+
+        fn update_balances(&self, _: Vec<(Address, U256)>) {}
+
+        fn fund_signers(&self) -> SignerResult<()> {
+            Ok(())
+        }
+    }
+
+    fn enabled_gate() -> IdleGate {
+        IdleGate::new(IdleSettings {
+            enabled: true,
+            grace: Duration::ZERO,
+        })
+    }
+
+    fn new_task(idle_gate: IdleGate) -> DelegationSenderTask<(), ()> {
+        let (_, action_rx) = mpsc::channel(1);
+        let (completion_tx, completion_rx) = mpsc::channel(1);
+        DelegationSenderTask {
+            action_rx,
+            completion_tx,
+            completion_rx,
+            queue: VecDeque::new(),
+            pending: HashSet::new(),
+            in_flight: 0,
+            mined: HashMap::new(),
+            current_block: 0,
+            heads_tx: broadcast::channel(1).0,
+            signer_manager: Arc::new(NoSigners),
+            provider: (),
+            fee_estimator: (),
+            settings: Settings {
+                max_blocks_to_wait_for_mine: 3,
+                max_fee_bumps: 3,
+                fee_bump_percent: 10,
+                max_delegation_gas: 1_000_000,
+            },
+            idle_gate,
+            idle_hold: None,
+        }
+    }
+
+    #[test]
+    fn idle_gate_held_while_delegation_queued_or_pending() {
+        let gate = enabled_gate();
+        let mut task = new_task(gate.clone());
+
+        assert!(gate.try_pause(|| true, || ()));
+        let id = task.enqueue(make_auth(1), None);
+        assert!(!gate.is_paused(), "an incoming delegation wakes the gate");
+
+        // Queued, waiting for a free signer.
+        task.update_idle_hold();
+        assert!(!gate.try_pause(|| true, || ()));
+
+        // Drained into a batch that is waiting to mine.
+        task.start_batch(1);
+        task.update_idle_hold();
+        assert!(!gate.try_pause(|| true, || ()));
+
+        task.handle_completion(CompletionEvent {
+            ids: vec![id],
+            result: Ok(B256::ZERO),
+        });
+        task.update_idle_hold();
+        assert!(gate.try_pause(|| true, || ()));
+    }
+
+    #[test]
+    fn idle_gate_held_until_every_batch_of_a_retried_delegation_completes() {
+        let gate = enabled_gate();
+        let mut task = new_task(gate.clone());
+
+        let id = task.enqueue(make_auth(1), None);
+        task.start_batch(1);
+        assert_eq!(task.enqueue(make_auth(1), None), id);
+        task.start_batch(1);
+
+        task.handle_completion(CompletionEvent {
+            ids: vec![id.clone()],
+            result: Ok(B256::ZERO),
+        });
+        task.update_idle_hold();
+        assert!(
+            !gate.try_pause(|| true, || ()),
+            "the retried batch is still in flight"
+        );
+
+        task.handle_completion(CompletionEvent {
+            ids: vec![id],
+            result: Ok(B256::ZERO),
+        });
+        task.update_idle_hold();
+        assert!(gate.try_pause(|| true, || ()));
+    }
+
+    #[test]
+    fn idle_gate_released_when_queued_delegation_expires() {
+        let gate = enabled_gate();
+        let mut task = new_task(gate.clone());
+
+        task.enqueue(make_auth(1), Some(100));
+        task.update_idle_hold();
+        assert!(!gate.try_pause(|| true, || ()));
+
+        task.drop_expired(200);
+        task.update_idle_hold();
+        assert!(gate.try_pause(|| true, || ()));
     }
 
     #[test]

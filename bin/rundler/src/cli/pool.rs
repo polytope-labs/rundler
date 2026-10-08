@@ -11,7 +11,11 @@
 // You should have received a copy of the GNU General Public License along with Rundler.
 // If not, see https://www.gnu.org/licenses/.
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    time::Duration,
+};
 
 use alloy_primitives::Address;
 use anyhow::Context;
@@ -19,7 +23,10 @@ use clap::Args;
 use rundler_pool::{LocalPoolBuilder, PoolConfig, PoolTask, PoolTaskArgs};
 use rundler_provider::Providers;
 use rundler_sim::MempoolConfigs;
-use rundler_task::TaskSpawnerExt;
+use rundler_task::{
+    TaskSpawnerExt,
+    idle::{IdleGate, IdleSettings},
+};
 use rundler_types::{
     EntryPointVersion,
     chain::{ChainSpec, TryIntoWithSpec},
@@ -91,6 +98,16 @@ pub struct PoolArgs {
         env = "POOL_ALLOWLIST_PATH"
     )]
     pub allowlist_path: Option<String>,
+
+    /// Paymasters allowed to sponsor operations. When set, operations with no paymaster
+    /// or an unlisted one are rejected on send; estimation is unaffected.
+    #[arg(
+        long = "pool.paymaster_allowlist",
+        name = "pool.paymaster_allowlist",
+        env = "POOL_PAYMASTER_ALLOWLIST",
+        value_delimiter = ','
+    )]
+    pub paymaster_allowlist: Vec<Address>,
 
     /// Interval at which the pool polls an Eth node for new blocks
     #[arg(
@@ -235,9 +252,44 @@ pub struct PoolArgs {
         default_value = "600"
     )]
     pub suspect_rpc_backoff_max_secs: u64,
+
+    /// Stop polling the node while nothing is pending or in flight. Needs the
+    /// pool and builder in one process (the `node` or `backend` command).
+    #[arg(
+        long = "pool.idle_pause_enabled",
+        name = "pool.idle_pause_enabled",
+        env = "POOL_IDLE_PAUSE_ENABLED",
+        default_value = "false"
+    )]
+    pub idle_pause_enabled: bool,
+
+    /// How long the pool and builder must stay idle before polling pauses.
+    #[arg(
+        long = "pool.idle_pause_grace_millis",
+        name = "pool.idle_pause_grace_millis",
+        env = "POOL_IDLE_PAUSE_GRACE_MILLIS",
+        default_value = "60000"
+    )]
+    pub idle_pause_grace_millis: u64,
 }
 
 impl PoolArgs {
+    /// Settings for the idle gate shared by the pool and builder.
+    pub fn idle_settings(&self) -> IdleSettings {
+        IdleSettings {
+            enabled: self.idle_pause_enabled,
+            grace: Duration::from_millis(self.idle_pause_grace_millis),
+        }
+    }
+
+    fn paymaster_allowlist(&self) -> Option<HashSet<Address>> {
+        if self.paymaster_allowlist.is_empty() {
+            None
+        } else {
+            Some(self.paymaster_allowlist.iter().copied().collect())
+        }
+    }
+
     /// Convert the CLI arguments into the arguments for the OP Pool combining
     /// common and op pool specific arguments.
     pub async fn to_args(
@@ -255,8 +307,10 @@ impl PoolArgs {
             Some(allowlist) => Some(get_json_config(allowlist).await?),
             None => None,
         };
+        let paymaster_allowlist = self.paymaster_allowlist();
         tracing::info!("blocklist: {:?}", blocklist);
         tracing::info!("allowlist: {:?}", allowlist);
+        tracing::info!("paymaster allowlist: {paymaster_allowlist:?}");
 
         let mempool_channel_configs = mempool_configs.unwrap_or_default();
 
@@ -275,6 +329,7 @@ impl PoolArgs {
             max_size_of_pool_bytes: self.max_size_in_bytes,
             blocklist: blocklist.clone(),
             allowlist: allowlist.clone(),
+            paymaster_allowlist,
             precheck_settings: common.try_into_with_spec(&chain_spec)?,
             sim_settings: common.try_into()?,
             throttled_entity_mempool_count: self.throttled_entity_mempool_count,
@@ -338,6 +393,7 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
     mempool_configs: Option<MempoolConfigs>,
 ) -> anyhow::Result<()> {
     let PoolCliArgs { pool: pool_args } = pool_args;
+    let idle_gate = standalone_idle_gate(&pool_args)?;
     let (event_sender, event_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     let task_args = pool_args
         .to_args(
@@ -358,9 +414,82 @@ pub async fn spawn_tasks<T: TaskSpawnerExt + 'static>(
         event_sender,
         LocalPoolBuilder::new(BLOCK_CHANNEL_CAPACITY),
         providers,
+        idle_gate,
     )
     .spawn(task_spawner)
     .await?;
 
     Ok(())
+}
+
+// The gate lives in process, so a builder in another process could neither
+// hold it nor see the resume floor.
+fn standalone_idle_gate(pool_args: &PoolArgs) -> anyhow::Result<IdleGate> {
+    if pool_args.idle_pause_enabled {
+        anyhow::bail!(
+            "pool.idle_pause_enabled needs the pool and builder in one process; \
+             use the node or backend command"
+        );
+    }
+    Ok(IdleGate::disabled())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        pool: PoolArgs,
+    }
+
+    fn pool_args(args: &[&str]) -> PoolArgs {
+        TestCli::parse_from(std::iter::once("test").chain(args.iter().copied())).pool
+    }
+
+    #[test]
+    fn idle_pause_defaults_to_off() {
+        let settings = pool_args(&[]).idle_settings();
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.grace, Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn idle_pause_flags_parse() {
+        let settings = pool_args(&[
+            "--pool.idle_pause_enabled",
+            "--pool.idle_pause_grace_millis",
+            "5000",
+        ])
+        .idle_settings();
+
+        assert!(settings.enabled);
+        assert_eq!(settings.grace, Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn standalone_pool_rejects_idle_pause() {
+        assert!(standalone_idle_gate(&pool_args(&["--pool.idle_pause_enabled"])).is_err());
+        assert!(standalone_idle_gate(&pool_args(&[])).is_ok());
+    }
+
+    #[test]
+    fn paymaster_allowlist_defaults_to_none() {
+        assert_eq!(pool_args(&[]).paymaster_allowlist(), None);
+    }
+
+    #[test]
+    fn paymaster_allowlist_parses_comma_list() {
+        let first = Address::random();
+        let second = Address::random();
+        let list = format!("{first},{second}");
+
+        let allowlist = pool_args(&["--pool.paymaster_allowlist", &list]).paymaster_allowlist();
+
+        assert_eq!(allowlist, Some(HashSet::from([first, second])));
+    }
 }

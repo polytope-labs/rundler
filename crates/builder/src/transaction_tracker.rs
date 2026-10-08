@@ -16,7 +16,7 @@ use std::sync::Arc;
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256, I256, U256};
 use alloy_sol_types::SolEvent;
-use anyhow::bail;
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use metrics::{Gauge, Histogram};
 use metrics_derive::Metrics;
@@ -48,6 +48,13 @@ pub(crate) trait TransactionTracker: Send + Sync {
 
     /// Returns the number of pending transactions.
     fn num_pending_transactions(&self) -> usize;
+
+    /// Returns true when any transaction is tracked, including ones that were
+    /// rejected as underpriced and so have no hash.
+    fn has_transactions(&self) -> bool;
+
+    /// Reads the tracked account's nonce at the latest block.
+    async fn chain_nonce(&self) -> TransactionTrackerResult<u64>;
 
     /// Sends the provided transaction and typically returns its transaction
     /// hash, but if the transaction failed to send because another transaction
@@ -379,6 +386,22 @@ where
             .iter()
             .filter(|t| t.tx_hash.is_some())
             .count()
+    }
+
+    fn has_transactions(&self) -> bool {
+        !self.transactions.is_empty()
+    }
+
+    async fn chain_nonce(&self) -> TransactionTrackerResult<u64> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no signer held"))?;
+        Ok(self
+            .provider
+            .get_transaction_count(signer.address())
+            .await
+            .context("failed to read the nonce")?)
     }
 
     async fn send_transaction(
