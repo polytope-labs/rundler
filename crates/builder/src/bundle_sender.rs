@@ -11,7 +11,14 @@
 // You should have received a copy of the GNU General Public License along with Rundler.
 // If not, see https://www.gnu.org/licenses/.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use alloy_primitives::{Address, B256, hex};
 use anyhow::{Context, bail};
@@ -546,8 +553,9 @@ where
             Ok(SendBundleAttemptResult::Success(_)) => {
                 // Senders confirmed in send_bundle, no lock release needed
                 info!("Bundle sent successfully");
+                // Heads that arrive during the build and send don't count toward the wait.
                 state.update(InnerState::Pending(inner.to_pending(
-                    block_number + self.settings.max_blocks_to_wait_for_mine,
+                    state.newest_block_number() + self.settings.max_blocks_to_wait_for_mine,
                 )));
             }
             Ok(SendBundleAttemptResult::NoOperationsInitially)
@@ -849,7 +857,7 @@ where
                 self.increment_counter("builder_cancellation_txns_sent", &pinned, 1);
 
                 state.update(InnerState::CancelPending(inner.to_cancel_pending(
-                    state.block_number() + self.settings.max_blocks_to_wait_for_mine,
+                    state.newest_block_number() + self.settings.max_blocks_to_wait_for_mine,
                 )));
             }
             Ok(None) => {
@@ -1626,6 +1634,10 @@ impl<T: TransactionTracker, TRIG: Trigger> SenderMachineState<T, TRIG> {
         self.trigger.last_block().block_number
     }
 
+    fn newest_block_number(&self) -> u64 {
+        self.block_number().max(self.trigger.latest_block_number())
+    }
+
     fn block_hash(&self) -> B256 {
         self.trigger.last_block().block_hash
     }
@@ -1811,15 +1823,43 @@ trait Trigger {
 
     // Get the last block processed by the trigger
     fn last_block(&self) -> &NewHead;
+
+    // Get the number of the newest block delivered to the trigger, processed or not
+    fn latest_block_number(&self) -> u64;
 }
 
 struct BundleSenderTrigger {
     bundling_mode: BundlingMode,
     block_rx: UnboundedReceiver<NewHead>,
+    latest_block_number: Arc<AtomicU64>,
     bundle_action_receiver: mpsc::Receiver<BundleSenderAction>,
     timer: tokio::time::Interval,
     last_block: NewHead,
     idle_gate: IdleGate,
+}
+
+/// Buffers heads for a [`BundleSenderTrigger`] and records the newest one delivered.
+#[derive(Clone)]
+struct BlockSender {
+    block_tx: UnboundedSender<NewHead>,
+    latest_block_number: Arc<AtomicU64>,
+}
+
+impl BlockSender {
+    fn channel() -> (Self, UnboundedReceiver<NewHead>) {
+        let (block_tx, block_rx) = mpsc::unbounded_channel();
+        let sender = Self {
+            block_tx,
+            latest_block_number: Arc::new(AtomicU64::new(0)),
+        };
+        (sender, block_rx)
+    }
+
+    fn send(&self, head: NewHead) -> Result<(), mpsc::error::SendError<NewHead>> {
+        self.latest_block_number
+            .store(head.block_number, Ordering::Relaxed);
+        self.block_tx.send(head)
+    }
 }
 
 #[async_trait]
@@ -1927,6 +1967,10 @@ impl Trigger for BundleSenderTrigger {
     fn last_block(&self) -> &NewHead {
         &self.last_block
     }
+
+    fn latest_block_number(&self) -> u64 {
+        self.latest_block_number.load(Ordering::Relaxed)
+    }
 }
 
 impl BundleSenderTrigger {
@@ -1937,7 +1981,8 @@ impl BundleSenderTrigger {
         heads_rx: broadcast::Receiver<Arc<NewHead>>,
         idle_gate: IdleGate,
     ) -> anyhow::Result<Self> {
-        let (block_tx, block_rx) = mpsc::unbounded_channel();
+        let (block_tx, block_rx) = BlockSender::channel();
+        let latest_block_number = block_tx.latest_block_number.clone();
 
         task_spawner.spawn_critical(
             "block stream",
@@ -1947,6 +1992,7 @@ impl BundleSenderTrigger {
         Ok(Self {
             bundling_mode: BundlingMode::Auto,
             block_rx,
+            latest_block_number,
             bundle_action_receiver,
             timer: tokio::time::interval(timer_interval),
             last_block: NewHead {
@@ -1969,7 +2015,7 @@ impl BundleSenderTrigger {
 
     async fn block_stream_task(
         mut heads_rx: broadcast::Receiver<Arc<NewHead>>,
-        block_tx: UnboundedSender<NewHead>,
+        block_tx: BlockSender,
     ) {
         loop {
             match heads_rx.recv().await {
@@ -2142,6 +2188,9 @@ mod tests {
 
         // block 0
         add_trigger_no_update_last_block(&mut mock_trigger, &mut Sequence::new(), 0);
+        mock_trigger
+            .expect_latest_block_number()
+            .return_const(0_u64);
 
         setup_tracker_default(&mut mock_tracker);
 
@@ -2526,6 +2575,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wait_for_mine_counts_from_head_at_send() {
+        let Mocks {
+            mut mock_proposer_t,
+            mut mock_tracker,
+            mock_trigger: _,
+            mut mock_pool,
+        } = new_mocks();
+
+        let (mut trigger, block_tx, _action_tx) =
+            new_trigger(BundlingMode::Auto, IdleGate::disabled());
+        trigger.last_block = new_head(10);
+
+        setup_tracker_default(&mut mock_tracker);
+
+        mock_pool
+            .expect_get_ops_summaries()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(vec![pool_op_summary(
+                    ENTRY_POINT_ADDRESS_V0_6,
+                    Address::ZERO,
+                )])
+            });
+        mock_pool
+            .expect_get_ops_by_hashes()
+            .times(1)
+            .returning(|_, _| Ok(vec![demo_pool_op()]));
+        mock_pool
+            .expect_notify_pending_bundle()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        mock_pool
+            .expect_report_bundle_outcome()
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        mock_make_bundle(&mut mock_proposer_t, 1, vec![(Address::ZERO, B256::ZERO)]);
+
+        // heads 11 and 12 arrive while the bundle is being sent
+        let send_block_tx = block_tx.clone();
+        mock_tracker
+            .expect_send_transaction()
+            .once()
+            .returning(move |_, _, _| {
+                send_block_tx.send(new_head(11)).unwrap();
+                send_block_tx.send(new_head(12)).unwrap();
+                Box::pin(async { Ok(B256::ZERO) })
+            });
+
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        let mut state = SenderMachineState::new(trigger, mock_tracker);
+
+        sender
+            .handle_building_state(
+                &mut state,
+                BuildingState {
+                    wait_for_trigger: false,
+                    fee_increase_count: 0,
+                    underpriced_info: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.inner,
+            InnerState::Pending(PendingState {
+                until: 15, // head 12 at send + wait 3 blocks
+                fee_increase_count: 0,
+            })
+        ));
+
+        block_tx.send(new_head(13)).unwrap();
+        let update = state.wait_for_trigger().await.unwrap();
+        sender.step_after_trigger(&mut state, update).await.unwrap();
+        assert!(matches!(
+            state.inner,
+            InnerState::Pending(PendingState { until: 15, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_mine_sees_head_buffered_during_send() {
+        let Mocks {
+            mut mock_proposer_t,
+            mut mock_tracker,
+            mock_trigger: _,
+            mut mock_pool,
+        } = new_mocks();
+
+        let (mut trigger, block_tx, _action_tx) =
+            new_trigger(BundlingMode::Auto, IdleGate::disabled());
+        trigger.last_block = new_head(10);
+
+        setup_tracker_default(&mut mock_tracker);
+
+        mock_pool
+            .expect_get_ops_summaries()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Ok(vec![pool_op_summary(
+                    ENTRY_POINT_ADDRESS_V0_6,
+                    Address::ZERO,
+                )])
+            });
+        mock_pool
+            .expect_get_ops_by_hashes()
+            .times(1)
+            .returning(|_, _| Ok(vec![demo_pool_op()]));
+        mock_pool
+            .expect_notify_pending_bundle()
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(()));
+        mock_pool
+            .expect_report_bundle_outcome()
+            .times(1)
+            .returning(|_, _, _, _| Ok(()));
+
+        mock_make_bundle(&mut mock_proposer_t, 1, vec![(Address::ZERO, B256::ZERO)]);
+
+        // the bundle mines in head 12, which arrives before the send returns
+        let send_block_tx = block_tx.clone();
+        mock_tracker
+            .expect_send_transaction()
+            .once()
+            .returning(move |_, _, _| {
+                send_block_tx.send(new_head(11)).unwrap();
+                send_block_tx.send(new_head_mined(12)).unwrap();
+                Box::pin(async { Ok(B256::ZERO) })
+            });
+        mock_tracker
+            .expect_process_update()
+            .withf(|update| update.nonce == Some(0) && update.mined_tx_hashes == [B256::ZERO])
+            .once()
+            .returning(|_| {
+                Box::pin(async {
+                    Ok(Some(TrackerUpdate::Mined {
+                        block_number: 12,
+                        nonce: 0,
+                        gas_limit: None,
+                        gas_used: None,
+                        gas_price: None,
+                        tx_hash: B256::ZERO,
+                        attempt_number: 0,
+                        is_success: true,
+                        user_op_events: vec![],
+                    }))
+                })
+            });
+
+        let mut sender = new_sender(mock_proposer_t, mock_pool);
+        let mut state = SenderMachineState::new(trigger, mock_tracker);
+
+        sender
+            .handle_building_state(
+                &mut state,
+                BuildingState {
+                    wait_for_trigger: false,
+                    fee_increase_count: 0,
+                    underpriced_info: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(state.inner, InnerState::Pending(_)));
+
+        let update = timeout(Duration::from_secs(1), state.wait_for_trigger())
+            .await
+            .expect("the head buffered during the send should still be processed")
+            .unwrap();
+        sender.step_after_trigger(&mut state, update).await.unwrap();
+        assert!(matches!(
+            state.inner,
+            InnerState::Building(BuildingState {
+                wait_for_trigger: false,
+                fee_increase_count: 0,
+                underpriced_info: None,
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_transition_to_cancel() {
         let Mocks {
             mock_proposer_t,
@@ -2614,6 +2844,10 @@ mod tests {
             .returning(|_| Box::pin(async { Ok(Some(B256::ZERO)) }));
 
         mock_trigger.expect_last_block().return_const(new_head(0));
+        // head 2 is delivered but not yet processed when the cancellation is sent
+        mock_trigger
+            .expect_latest_block_number()
+            .return_const(2_u64);
 
         let mut state = new_state_with(
             mock_trigger,
@@ -2637,7 +2871,7 @@ mod tests {
         assert!(matches!(
             state.inner,
             InnerState::CancelPending(CancelPendingState {
-                until: 3,
+                until: 5, // head 2 at send + wait 3 blocks
                 fee_increase_count: 0,
             })
         ));
@@ -2666,6 +2900,9 @@ mod tests {
             .returning(|_| Box::pin(async { Ok(Some(B256::ZERO)) }));
 
         mock_trigger.expect_last_block().return_const(new_head(0));
+        mock_trigger
+            .expect_latest_block_number()
+            .return_const(0_u64);
 
         let mut state = new_state_with(
             mock_trigger,
@@ -4288,14 +4525,15 @@ mod tests {
         idle_gate: IdleGate,
     ) -> (
         BundleSenderTrigger,
-        UnboundedSender<NewHead>,
+        BlockSender,
         mpsc::Sender<BundleSenderAction>,
     ) {
-        let (block_tx, block_rx) = mpsc::unbounded_channel();
+        let (block_tx, block_rx) = BlockSender::channel();
         let (action_tx, bundle_action_receiver) = mpsc::channel(1);
         let trigger = BundleSenderTrigger {
             bundling_mode,
             block_rx,
+            latest_block_number: block_tx.latest_block_number.clone(),
             bundle_action_receiver,
             timer: tokio::time::interval(TRIGGER_INTERVAL),
             last_block: new_head(0),

@@ -114,7 +114,7 @@ In the building state the sender is waiting for a trigger. Once triggered, the s
 
 **`Pending`**
 
-In the pending state the builder is waiting for a bundle transaction to be mined. It will wait in this state for up to `max_blocks_to_wait_for_mine` blocks. If mined, dropped, or timed out (abandoned) the sender will transition back to the building state with the appropriate metadata captured.
+In the pending state the builder is waiting for a bundle transaction to be mined. It will wait in this state for up to `max_blocks_to_wait_for_mine` blocks, counted from the newest head the sender has received shortly after the transaction is sent. If mined, dropped, or timed out (abandoned) the sender will transition back to the building state with the appropriate metadata captured.
 
 **`Cancelling`**
 
@@ -122,7 +122,7 @@ In the cancelling state the builder creates a cancellation operation. The shape 
 
 **`CancelPending`**
 
-In the cancel pending state the builder is waiting for a cancellation transaction to be mined. It will wait in this state for up to `max_blocks_to_wait_for_mine` blocks. If mined, the sender will transition back to the building state. If dropped or timed out (abandoned), the sender will transition back to the cancelling state. If the sender has already performed `max_cancellation_fee_increases`, and the transaction has been abandoned, it will transition back to the building state and reset internal state.
+In the cancel pending state the builder is waiting for a cancellation transaction to be mined. It will wait in this state for up to `max_blocks_to_wait_for_mine` blocks, counted from the newest head the sender has received shortly after the cancellation is sent. If mined, the sender will transition back to the building state. If dropped or timed out (abandoned), the sender will transition back to the cancelling state. If the sender has already performed `max_cancellation_fee_increases`, and the transaction has been abandoned, it will transition back to the building state and reset internal state.
 
 ### Triggers
 
