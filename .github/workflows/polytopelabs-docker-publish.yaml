@@ -1,0 +1,79 @@
+name: Polytopelabs Docker publish
+
+on:
+  push:
+    tags:
+      - "polytope-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag, e.g. v0.11.0-polytope.1"
+        required: true
+        type: string
+      latest:
+        description: "Also tag the image as latest"
+        default: true
+        type: boolean
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DOCKER_IMAGE_NAME: polytopelabs/rundler
+
+jobs:
+  build:
+    name: build and push
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@cross
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
+
+      - name: Set up Docker builder
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install arm64,amd64
+          docker buildx create --use --name cross-builder
+
+      - name: Resolve image tag
+        id: tag
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_LATEST: ${{ inputs.latest }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+            echo "latest=$INPUT_LATEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#polytope-}" >> "$GITHUB_OUTPUT"
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push image
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          LATEST: ${{ steps.tag.outputs.latest }}
+        run: |
+          target=docker-build
+          if [ "$LATEST" = "true" ]; then target=docker-build-latest; fi
+          sudo -E env "PATH=$PATH" make DOCKER_IMAGE_NAME="$DOCKER_IMAGE_NAME" GIT_TAG="$VERSION" "$target"
