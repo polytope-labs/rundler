@@ -540,7 +540,7 @@ mod tests {
         atomic::{AtomicU64, Ordering},
     };
 
-    use alloy_primitives::{hex, uint};
+    use alloy_primitives::{address, hex, uint};
     use alloy_sol_types::{Revert, SolError, SolValue};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use rundler_contracts::{
@@ -552,6 +552,7 @@ mod tests {
     };
     use rundler_types::{
         GasFees,
+        constants::SIMULATION_SENDER,
         da::DAGasOracleType,
         v0_6::{UserOperation, UserOperationOptionalGas, UserOperationRequiredFields},
     };
@@ -649,6 +650,14 @@ mod tests {
         entry: MockEntryPointV0_6,
         provider: MockEvmProvider,
     ) -> (GasEstimatorWithMocks, Settings) {
+        create_estimator_with_chain_spec(ChainSpec::default(), entry, provider)
+    }
+
+    fn create_estimator_with_chain_spec(
+        chain_spec: ChainSpec,
+        entry: MockEntryPointV0_6,
+        provider: MockEvmProvider,
+    ) -> (GasEstimatorWithMocks, Settings) {
         let settings = Settings {
             max_verification_gas: TEST_MAX_GAS_LIMITS,
             max_bundle_execution_gas: TEST_MAX_GAS_LIMITS,
@@ -662,7 +671,7 @@ mod tests {
             max_gas_estimation_rounds: 3,
         };
         let estimator = create_custom_estimator(
-            ChainSpec::default(),
+            chain_spec,
             provider,
             MockFeeEstimator::new(),
             entry,
@@ -1024,6 +1033,46 @@ mod tests {
             .await;
 
         assert!(estimation.is_err());
+    }
+
+    /// Accounts and paymasters can restrict `tx.origin`, so verification gas estimation
+    /// must be sent from the chain spec's simulation sender.
+    #[tokio::test]
+    async fn test_verification_gas_estimation_uses_chain_spec_simulation_sender() {
+        let signer = address!("0x5668Cd0b956fe12955514496B8A3dc4971402f80");
+        let configured = ChainSpec {
+            simulation_sender: signer,
+            ..Default::default()
+        };
+
+        for (chain_spec, sender) in [
+            (ChainSpec::default(), SIMULATION_SENDER),
+            (configured, signer),
+        ] {
+            let (entry, mut provider) = create_base_config();
+
+            // A call from any other sender matches no expectation and fails the test. The
+            // estimation itself fails as the call doesn't revert, only the request matters.
+            provider
+                .expect_call()
+                .withf(move |tx, _block, _state_override| tx.from == Some(sender))
+                .times(1)
+                .returning(|_a, _b, _c| Ok(Bytes::new()));
+
+            let (estimator, _) = create_estimator_with_chain_spec(chain_spec, entry, provider);
+            let optional_op = demo_user_op_optional_gas(Some(10000));
+            let user_op = demo_user_op();
+            let estimation = estimator
+                .estimate_verification_gas(
+                    &optional_op,
+                    &user_op,
+                    B256::ZERO,
+                    StateOverride::default(),
+                )
+                .await;
+
+            assert!(estimation.is_err());
+        }
     }
 
     #[tokio::test]

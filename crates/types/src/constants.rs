@@ -15,6 +15,7 @@
 
 use alloy_primitives::{Address, address};
 
-/// Address used for simulation calls to the entry point.
+/// Default address used for simulation calls to the entry point, can be overridden per chain
+/// with the chain spec's `simulation_sender`.
 /// Calculated as `address(uint160(uint256(keccak256("rundler simulation sender"))))`.
 pub const SIMULATION_SENDER: Address = address!("0x0643866dA50efE0b055Cd15aF95191968c8411b5");

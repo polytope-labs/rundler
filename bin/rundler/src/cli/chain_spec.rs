@@ -126,3 +126,39 @@ define_hardcoded_chain_specs!(
     bsc,
     bsc_testnet
 );
+
+#[cfg(test)]
+mod tests {
+    use rundler_types::constants::SIMULATION_SENDER;
+
+    use super::*;
+
+    #[test]
+    fn hardcoded_chain_specs_resolve() {
+        for network in HARDCODED_CHAIN_SPECS {
+            let chain_spec = resolve_chain_spec(&Some(network.to_string()), &None);
+            assert_ne!(chain_spec.id, 0, "{network} should have a chain id");
+            assert_eq!(
+                chain_spec.simulation_sender, SIMULATION_SENDER,
+                "{network} should simulate from the default sender"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrum_and_polygon_support_eip7702() {
+        for network in ["arbitrum", "arbitrum_sepolia", "polygon", "polygon_amoy"] {
+            let chain_spec = resolve_chain_spec(&Some(network.to_string()), &None);
+            for entry_point in [
+                chain_spec.entry_point_address_v0_7,
+                chain_spec.entry_point_address_v0_8,
+                chain_spec.entry_point_address_v0_9,
+            ] {
+                assert!(
+                    chain_spec.supports_eip7702(entry_point),
+                    "{network} should support EIP-7702 on entry point {entry_point}"
+                );
+            }
+        }
+    }
+}

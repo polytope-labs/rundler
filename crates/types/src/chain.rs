@@ -19,7 +19,8 @@ use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EntryPointVersion, aggregator::SignatureAggregator, da::DAGasOracleType, proxy::SubmissionProxy,
+    EntryPointVersion, aggregator::SignatureAggregator, constants::SIMULATION_SENDER,
+    da::DAGasOracleType, proxy::SubmissionProxy,
 };
 
 const ENTRY_POINT_ADDRESS_V0_6: &str = "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789";
@@ -137,6 +138,17 @@ pub struct ChainSpec {
     pub bundle_simulation_omit_gas_fees: bool,
 
     /*
+     * Simulation
+     */
+    /// Address that validation and gas estimation calls to the entry point are sent from,
+    /// and thus the `tx.origin` that accounts and paymasters observe during simulation.
+    ///
+    /// Defaults to [`SIMULATION_SENDER`]. Set this to the bundle signer when a paymaster
+    /// restricts `tx.origin` to a list of bundlers, so that it accepts simulation as it
+    /// does the bundle itself. Must be an EOA without an EIP-7702 delegation.
+    pub simulation_sender: Address,
+
+    /*
      * Senders
      */
     /// True if the flashbots sender is enabled on this chain
@@ -219,6 +231,7 @@ impl Default for ChainSpec {
             max_transaction_size_bytes: 131072, // 128 KiB
             bundle_max_send_interval_millis: 1000,
             bundle_simulation_omit_gas_fees: false,
+            simulation_sender: SIMULATION_SENDER,
             flashbots_enabled: false,
             flashbots_relay_url: None,
             bloxroute_enabled: false,

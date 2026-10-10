@@ -42,7 +42,6 @@ use rundler_types::{
     ValidationRevert,
     authorization::Eip7702Auth,
     chain::ChainSpec,
-    constants::SIMULATION_SENDER,
     da::{DAGasBlockData, DAGasData},
     v0_7::{UserOperation, UserOperationBuilder, UserOperationRequiredFields},
 };
@@ -431,7 +430,7 @@ where
         let txn_req = self
             .i_entry_point
             .handleOps(vec![user_op.pack()], Address::random())
-            .from(SIMULATION_SENDER)
+            .from(self.chain_spec.simulation_sender)
             .into_transaction_request();
 
         let data = txn_req.inner.input.into_input().unwrap();
@@ -493,7 +492,7 @@ where
         let call = ep_simulations
             .simulateValidation(user_op.pack())
             .gas(self.max_verification_gas.saturating_add(da_gas))
-            .from(SIMULATION_SENDER)
+            .from(self.chain_spec.simulation_sender)
             .into_transaction_request();
 
         Ok((call.inner, override_ep))
@@ -664,14 +663,12 @@ fn get_handle_ops_call<AP: AlloyProvider>(
             entry_point
                 .handleOps(ops_per_aggregator.swap_remove(0).userOps, sender_eoa)
                 .chain_id(chain_id)
-                .from(SIMULATION_SENDER)
                 .into_transaction_request()
                 .inner
         } else {
             entry_point
                 .handleAggregatedOps(ops_per_aggregator, sender_eoa)
                 .chain_id(chain_id)
-                .from(SIMULATION_SENDER)
                 .into_transaction_request()
                 .inner
         };
@@ -853,7 +850,7 @@ async fn simulate_handle_op_inner<AP: AlloyProvider>(
             .block(block_id)
             .gas(execution_gas_limit.saturating_add(da_gas))
             .state(state_override)
-            .from(SIMULATION_SENDER)
+            .from(chain_spec.simulation_sender)
             .call()
             .await
     } else {
@@ -862,7 +859,7 @@ async fn simulate_handle_op_inner<AP: AlloyProvider>(
             .block(block_id)
             .gas(execution_gas_limit.saturating_add(da_gas))
             .state(state_override)
-            .from(SIMULATION_SENDER)
+            .from(chain_spec.simulation_sender)
             .call()
             .await
     };
@@ -928,9 +925,83 @@ fn add_authorization_tuple(
 
 #[cfg(test)]
 mod tests {
+    use alloy_primitives::address;
     use alloy_provider::RootProvider;
+    use rundler_types::constants::SIMULATION_SENDER;
 
     use super::*;
+    use crate::{ZeroDAGasOracle, alloy::entry_point::test_utils::CallRecorder};
+
+    /// Accounts and paymasters can restrict `tx.origin`, so validation and estimation
+    /// calls must all be sent from the chain spec's simulation sender.
+    #[tokio::test]
+    async fn test_simulation_calls_use_chain_spec_simulation_sender() {
+        let signer = address!("0x5668Cd0b956fe12955514496B8A3dc4971402f80");
+        let configured = ChainSpec {
+            simulation_sender: signer,
+            ..Default::default()
+        };
+
+        for (chain_spec, sender) in [
+            (ChainSpec::default(), SIMULATION_SENDER),
+            (configured, signer),
+        ] {
+            let recorder = CallRecorder::default();
+            let entry_point = EntryPointProvider::new(
+                chain_spec.clone(),
+                EntryPointVersion::V0_7,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                recorder.provider(),
+                ZeroDAGasOracle,
+            );
+            let op = UserOperationBuilder::new(
+                &chain_spec,
+                EntryPointVersion::V0_7,
+                UserOperationRequiredFields {
+                    sender: Address::ZERO,
+                    nonce: U256::ZERO,
+                    call_data: Bytes::new(),
+                    call_gas_limit: 0,
+                    verification_gas_limit: 0,
+                    pre_verification_gas: 0,
+                    max_priority_fee_per_gas: 0,
+                    max_fee_per_gas: 0,
+                    signature: Bytes::new(),
+                },
+            )
+            .build();
+
+            let (call, _) = entry_point
+                .get_tracer_simulate_validation_call(op.clone())
+                .unwrap();
+            assert_eq!(call.from, Some(sender));
+
+            // The recorder fails every call, only the requests matter here.
+            let _ = entry_point.simulate_validation(op.clone(), None).await;
+            let _ = entry_point
+                .simulate_handle_op(
+                    op.clone(),
+                    Address::ZERO,
+                    Bytes::new(),
+                    BlockId::latest(),
+                    StateOverride::default(),
+                )
+                .await;
+            let _ = entry_point
+                .simulate_handle_op_estimate_gas(
+                    op,
+                    Address::ZERO,
+                    Bytes::new(),
+                    BlockId::latest(),
+                    StateOverride::default(),
+                )
+                .await;
+            assert_eq!(recorder.senders(), vec![Some(sender); 3]);
+        }
+    }
 
     /// The bundle validation call must be able to omit its fee caps, while the
     /// transaction that is actually submitted always carries them. Some chains
