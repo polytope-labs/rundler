@@ -129,7 +129,21 @@ define_hardcoded_chain_specs!(
 
 #[cfg(test)]
 mod tests {
+    use rundler_types::constants::SIMULATION_SENDER;
+
     use super::*;
+
+    #[test]
+    fn hardcoded_chain_specs_resolve() {
+        for network in HARDCODED_CHAIN_SPECS {
+            let chain_spec = resolve_chain_spec(&Some(network.to_string()), &None);
+            assert_ne!(chain_spec.id, 0, "{network} should have a chain id");
+            assert_eq!(
+                chain_spec.simulation_sender, SIMULATION_SENDER,
+                "{network} should simulate from the default sender"
+            );
+        }
+    }
 
     #[test]
     fn arbitrum_and_polygon_support_eip7702() {

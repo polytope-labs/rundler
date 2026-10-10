@@ -87,6 +87,61 @@ fn max_bundle_transaction_data(
 }
 
 #[cfg(test)]
+pub(crate) mod test_utils {
+    use std::{
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    use alloy_json_rpc::{RequestPacket, ResponsePacket};
+    use alloy_primitives::Address;
+    use alloy_provider::{RootProvider, network::AnyNetwork};
+    use alloy_rpc_client::RpcClient;
+    use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
+    use serde_json::Value;
+    use tower::Service;
+
+    /// Transport that records the `from` of each `eth_call` it is sent, then fails the call.
+    #[derive(Clone, Default)]
+    pub(crate) struct CallRecorder {
+        senders: Arc<Mutex<Vec<Option<Address>>>>,
+    }
+
+    impl CallRecorder {
+        pub(crate) fn provider(&self) -> RootProvider<AnyNetwork> {
+            RootProvider::new(RpcClient::new(self.clone(), true))
+        }
+
+        /// The `from` of each `eth_call` received so far, in order.
+        pub(crate) fn senders(&self) -> Vec<Option<Address>> {
+            self.senders.lock().unwrap().clone()
+        }
+    }
+
+    impl Service<RequestPacket> for CallRecorder {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, packet: RequestPacket) -> Self::Future {
+            for request in packet.requests() {
+                if request.method() != "eth_call" {
+                    continue;
+                }
+                let params: Value = serde_json::from_str(request.params().unwrap().get()).unwrap();
+                let from = params[0]["from"].as_str().map(|from| from.parse().unwrap());
+                self.senders.lock().unwrap().push(from);
+            }
+            Box::pin(async { Err(TransportErrorKind::custom_str("call recorded")) })
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::is_base_fee_too_low;
 
