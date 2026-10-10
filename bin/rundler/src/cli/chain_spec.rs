@@ -126,3 +126,25 @@ define_hardcoded_chain_specs!(
     bsc,
     bsc_testnet
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arbitrum_and_polygon_support_eip7702() {
+        for network in ["arbitrum", "arbitrum_sepolia", "polygon", "polygon_amoy"] {
+            let chain_spec = resolve_chain_spec(&Some(network.to_string()), &None);
+            for entry_point in [
+                chain_spec.entry_point_address_v0_7,
+                chain_spec.entry_point_address_v0_8,
+                chain_spec.entry_point_address_v0_9,
+            ] {
+                assert!(
+                    chain_spec.supports_eip7702(entry_point),
+                    "{network} should support EIP-7702 on entry point {entry_point}"
+                );
+            }
+        }
+    }
+}
