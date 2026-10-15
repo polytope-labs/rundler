@@ -345,13 +345,7 @@ impl TransactionSenderArgs {
         let provider = rundler_provider::new_alloy_evm_provider(config)?;
         let sender = match self {
             Self::Raw(args) => {
-                let config = AlloyNetworkConfig {
-                    rpc_url: args
-                        .submit_url
-                        .parse()
-                        .context("invalid builder submit URL")?,
-                    ..config.clone()
-                };
+                let config = submit_network_config(config, &args.submit_url)?;
                 let submitter = rundler_provider::new_alloy_evm_provider(&config)?;
 
                 TransactionSenderEnum::Raw(RawTransactionSender::new(
@@ -367,13 +361,7 @@ impl TransactionSenderArgs {
                 PolygonBloxrouteTransactionSender::new(provider, &args.header)?,
             ),
             Self::PolygonPrivate(args) => {
-                let config = AlloyNetworkConfig {
-                    rpc_url: args
-                        .submit_url
-                        .parse()
-                        .context("invalid builder submit URL")?,
-                    ..config.clone()
-                };
+                let config = submit_network_config(config, &args.submit_url)?;
                 let submitter = rundler_provider::new_alloy_evm_provider(&config)?;
 
                 TransactionSenderEnum::PolygonPrivate(PolygonPrivateSender::new(submitter))
@@ -391,6 +379,25 @@ impl TransactionSenderArgs {
         };
         Ok(sender)
     }
+}
+
+/// Network config for a sender that submits to `submit_url`.
+///
+/// The `node_http` fallback URLs are kept only when `submit_url` is `node_http` itself. A
+/// dedicated submit endpoint, such as a private relay, never falls back to the public RPCs, where
+/// its transactions would reach the public mempool.
+fn submit_network_config(
+    config: &AlloyNetworkConfig,
+    submit_url: &str,
+) -> anyhow::Result<AlloyNetworkConfig> {
+    let mut submit_config = AlloyNetworkConfig {
+        rpc_url: submit_url.parse().context("invalid builder submit URL")?,
+        ..config.clone()
+    };
+    if submit_config.rpc_url != config.rpc_url {
+        submit_config.rpc_fallback_urls.clear();
+    }
+    Ok(submit_config)
 }
 
 /// Custom errors for the sender constructor
@@ -479,10 +486,10 @@ impl From<TransactionSubmissionError> for TxSenderError {
 mod tests {
     use alloy_json_rpc::Id;
     use alloy_transport::TransportErrorKind;
-    use rundler_provider::ProviderError;
+    use rundler_provider::{AlloyNetworkConfig, ProviderError};
     use rundler_types::chain::ChainSpec;
 
-    use super::{RpcOutcomeClass, TxSenderError};
+    use super::{RpcOutcomeClass, TxSenderError, submit_network_config};
 
     #[test]
     fn classifies_rpc_outcomes() {
@@ -775,5 +782,22 @@ mod tests {
             super::parse_known_call_execution_failed("invalid sequence: invalid sequence", -32000);
 
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn submit_config_keeps_fallbacks_only_for_node_http() {
+        let node_http = "https://node.example/key";
+        let config = AlloyNetworkConfig {
+            rpc_url: node_http.parse().unwrap(),
+            rpc_fallback_urls: vec!["https://fallback.example/key".parse().unwrap()],
+            ..AlloyNetworkConfig::default()
+        };
+
+        let same = submit_network_config(&config, node_http).unwrap();
+        assert_eq!(same.rpc_fallback_urls, config.rpc_fallback_urls);
+
+        let private = submit_network_config(&config, "https://private-relay.example").unwrap();
+        assert_eq!(private.rpc_url.as_str(), "https://private-relay.example/");
+        assert!(private.rpc_fallback_urls.is_empty());
     }
 }

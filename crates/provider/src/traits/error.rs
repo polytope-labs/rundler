@@ -89,7 +89,49 @@ impl ProviderError {
             _ => false,
         }
     }
+
+    /// Returns true when the node reports that it already holds this exact transaction.
+    ///
+    /// With RPC fallback URLs, a send whose response was lost on one endpoint is resubmitted on
+    /// the next, which then answers like this for a transaction that is in fact in the mempool.
+    /// Geth answers `already known`, older Geth `known transaction: <hash>`, Nethermind
+    /// `AlreadyKnown`.
+    pub fn is_already_known(&self) -> bool {
+        let ProviderError::RPC(RpcError::ErrorResp(response)) = self else {
+            return false;
+        };
+        let message = response.message.to_ascii_lowercase();
+        message.contains("already known")
+            || message.contains("alreadyknown")
+            || message.starts_with("known transaction")
+    }
 }
 
 /// Result of a provider method call
 pub type ProviderResult<T> = Result<T, ProviderError>;
+
+#[cfg(test)]
+mod tests {
+    use alloy_json_rpc::ErrorPayload;
+
+    use super::*;
+
+    fn rpc_error(message: &str) -> ProviderError {
+        ProviderError::RPC(RpcError::ErrorResp(ErrorPayload {
+            code: -32000,
+            message: message.to_string().into(),
+            data: None,
+        }))
+    }
+
+    #[test]
+    fn recognizes_already_known_transactions() {
+        assert!(rpc_error("already known").is_already_known());
+        assert!(rpc_error("AlreadyKnown").is_already_known());
+        assert!(rpc_error("known transaction: 0x1234").is_already_known());
+
+        assert!(!rpc_error("nonce too low").is_already_known());
+        assert!(!rpc_error("replacement transaction underpriced").is_already_known());
+        assert!(!ProviderError::RPC(TransportErrorKind::backend_gone()).is_already_known());
+    }
+}

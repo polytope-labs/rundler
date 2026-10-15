@@ -243,6 +243,18 @@ pub struct CommonArgs {
     )]
     node_http: Option<String>,
 
+    /// Fallback ETH Node HTTP URLs, comma separated, tried in order when a request to
+    /// `node_http` fails at the transport level (connection error, non-2xx HTTP status,
+    /// unparseable response or client-side timeout)
+    #[arg(
+        long = "node_http_fallback",
+        name = "node_http_fallback",
+        env = "NODE_HTTP_FALLBACK",
+        value_delimiter = ',',
+        global = true
+    )]
+    node_http_fallback: Vec<String>,
+
     /// Flag for turning unsafe bundling mode on
     #[arg(long = "unsafe", env = "UNSAFE", global = true)]
     unsafe_mode: bool,
@@ -533,6 +545,17 @@ pub struct CommonArgs {
     )]
     pub provider_consistency_retry_enabled: bool,
 
+    /// Seconds an RPC URL that failed is tried only after the other URLs, before it is
+    /// preferred again
+    #[arg(
+        long = "provider_fallback_cooldown_seconds",
+        name = "provider_fallback_cooldown_seconds",
+        env = "PROVIDER_FALLBACK_COOLDOWN_SECONDS",
+        default_value = "30",
+        global = true
+    )]
+    pub provider_fallback_cooldown_seconds: u64,
+
     #[arg(
         long = "max_expected_storage_slots",
         name = "max_expected_storage_slots",
@@ -700,8 +723,24 @@ impl TryFrom<&CommonArgs> for AlloyNetworkConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: &CommonArgs) -> Result<Self, Self::Error> {
+        let rpc_fallback_urls = value
+            .node_http_fallback
+            .iter()
+            .map(|url| url.trim())
+            .filter(|url| !url.is_empty())
+            .enumerate()
+            .map(|(index, url)| {
+                let position = index + 1;
+                Url::parse(url).with_context(|| {
+                    format!("invalid node_http_fallback URL at position {position}")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
         Ok(Self {
             rpc_url: Url::parse(value.node_http.as_ref().context("must provide node_http")?)?,
+            rpc_fallback_urls,
+            rpc_fallback_cooldown_seconds: value.provider_fallback_cooldown_seconds,
             client_timeout_seconds: value.provider_client_timeout_seconds,
             rate_limit_retry_enabled: value.provider_rate_limit_retry_enabled,
             consistency_retry_enabled: value.provider_consistency_retry_enabled,
@@ -1013,4 +1052,115 @@ async fn load_configs(
     };
 
     Ok((mempool_configs, builders_config))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, PoisonError};
+
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        common: CommonArgs,
+    }
+
+    /// Held by every test that parses `CommonArgs`, since parsing reads NODE_HTTP_FALLBACK from
+    /// the environment and one test sets it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn parse_network_config(args: &[&str]) -> anyhow::Result<AlloyNetworkConfig> {
+        let cli = TestCli::parse_from(std::iter::once("test").chain(args.iter().copied()));
+        AlloyNetworkConfig::try_from(&cli.common)
+    }
+
+    fn network_config(args: &[&str]) -> anyhow::Result<AlloyNetworkConfig> {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        parse_network_config(args)
+    }
+
+    #[test]
+    fn node_http_fallback_urls_are_parsed_in_order() {
+        let config = network_config(&[
+            "--node_http",
+            "https://primary.example/key",
+            "--node_http_fallback",
+            "https://first.example/key, https://second.example/key",
+            "--provider_fallback_cooldown_seconds",
+            "45",
+        ])
+        .unwrap();
+
+        assert_eq!(config.rpc_url.as_str(), "https://primary.example/key");
+        assert_eq!(
+            config
+                .rpc_fallback_urls
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            vec!["https://first.example/key", "https://second.example/key"]
+        );
+        assert_eq!(config.rpc_fallback_cooldown_seconds, 45);
+    }
+
+    #[test]
+    fn node_http_fallback_defaults_to_none() {
+        let config = network_config(&["--node_http", "https://primary.example/key"]).unwrap();
+
+        assert!(config.rpc_fallback_urls.is_empty());
+        assert_eq!(config.rpc_fallback_cooldown_seconds, 30);
+    }
+
+    #[test]
+    fn empty_node_http_fallback_is_ignored() {
+        let config = network_config(&[
+            "--node_http",
+            "https://primary.example/key",
+            "--node_http_fallback",
+            "",
+        ])
+        .unwrap();
+
+        assert!(config.rpc_fallback_urls.is_empty());
+    }
+
+    #[test]
+    fn node_http_fallback_env_var_is_split_on_commas() {
+        // Deployments configure rundler through environment variables, so the env form must
+        // split the same way as the flag.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: every test that reads NODE_HTTP_FALLBACK holds ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                "NODE_HTTP_FALLBACK",
+                "https://first.example/key,https://second.example/key",
+            );
+        }
+        let config = parse_network_config(&["--node_http", "https://primary.example/key"]);
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("NODE_HTTP_FALLBACK");
+        }
+
+        assert_eq!(config.unwrap().rpc_fallback_urls.len(), 2);
+    }
+
+    #[test]
+    fn invalid_node_http_fallback_is_rejected() {
+        let error = network_config(&[
+            "--node_http",
+            "https://primary.example/key",
+            "--node_http_fallback",
+            "https://ok.example,not a url",
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid node_http_fallback URL at position 2"
+        );
+    }
 }

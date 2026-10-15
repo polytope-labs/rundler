@@ -30,6 +30,8 @@ See [chain spec](./architecture/chain_spec.md) for a detailed description of cha
 
 - `--node_http`: EVM Node HTTP URL to use. (**REQUIRED**)
   - env: _NODE_HTTP_
+- `--node_http_fallback`: Fallback EVM Node HTTP URLs, comma separated, tried in order when a request to `node_http` fails at the transport level: a connection error, a non-2xx HTTP status (after any rate limit retries), a body that is not JSON-RPC, or the client-side timeout. JSON-RPC error responses such as `execution reverted` are returned as is and never retried on another URL. A URL that fails is tried only after the others for `provider_fallback_cooldown_seconds`, then preferred again. Applies to every provider built from `node_http`, including the raw sender when it submits to `node_http`; a separate `builder.submit_url` never falls back. Log lines name endpoints by scheme and host only, so API keys in URL paths are not logged. (default: None)
+  - env: _NODE_HTTP_FALLBACK_
 - `--max_verification_gas`: Maximum verification gas. (default: `5000000`).
   - env: _MAX_VERIFICATION_GAS_
 - `--max_uo_cost`: Maximum cost of a UO that the mempool will accept. Optional, defaults to MAX (default: `None`).
@@ -111,6 +113,8 @@ See [chain spec](./architecture/chain_spec.md) for a detailed description of cha
   - env: _PROVIDER_RATE_LIMIT_RETRY_ENABLED_
 - `--provider_consistency_retry_enabled`: Enable retries on block consistency errors - with default backoff settings (default: `false`)
   - env: _PROVIDER_CONSISTENCY_RETRY_ENABLED_
+- `--provider_fallback_cooldown_seconds`: Seconds an RPC URL that failed is tried only after the other `node_http` / `node_http_fallback` URLs, before it is preferred again (default: `30`)
+  - env: _PROVIDER_FALLBACK_COOLDOWN_SECONDS_
 - `--eip7702_authority_pending_check_enabled`: Enable checking for EIP-7702 authority pending transaction errors (default: `false`)
   - env: _EIP7702_AUTHORITY_PENDING_CHECK_ENABLED_
   - NOTE: This uses the `NODE_RPC` and thus is only viable on networks with P2P mempools. L2s with centralized sequencers will not work.
