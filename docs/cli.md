@@ -30,7 +30,7 @@ See [chain spec](./architecture/chain_spec.md) for a detailed description of cha
 
 - `--node_http`: EVM Node HTTP URL to use. (**REQUIRED**)
   - env: _NODE_HTTP_
-- `--node_http_fallback`: Fallback EVM Node HTTP URLs, comma separated, tried in order when a request to `node_http` fails at the transport level: a connection error, a non-2xx HTTP status (after any rate limit retries), a body that is not JSON-RPC, or the client-side timeout. JSON-RPC error responses such as `execution reverted` are returned as is and never retried on another URL. A URL that fails is tried only after the others for `provider_fallback_cooldown_seconds`, then preferred again. Applies to every provider built from `node_http`, including the raw sender when it submits to `node_http`; a separate `builder.submit_url` never falls back. Log lines name endpoints by scheme and host only, so API keys in URL paths are not logged. (default: None)
+- `--node_http_fallback`: Fallback EVM Node HTTP URLs, comma separated, tried in order when a request to `node_http` fails at the transport level: a connection error, a non-2xx HTTP status (a 429 moves on at once, and rate-limit backoff only starts once every URL has refused), a body that is not JSON-RPC, or the client-side timeout. JSON-RPC error responses such as `execution reverted` are returned as is and never retried on another URL. A URL that fails is tried only after the others for `provider_fallback_cooldown_seconds`, then preferred again. While `node_http` is in cooldown every read is served by a fallback, so fallback URLs must serve the same chain and keep up with its tip. Applies to every provider built from `node_http`, including the raw sender when it submits to `node_http`; a separate `builder.submit_url` never falls back. Provider URLs are logged by scheme and host only. (default: None)
   - env: _NODE_HTTP_FALLBACK_
 - `--max_verification_gas`: Maximum verification gas. (default: `5000000`).
   - env: _MAX_VERIFICATION_GAS_
@@ -115,6 +115,8 @@ See [chain spec](./architecture/chain_spec.md) for a detailed description of cha
   - env: _PROVIDER_CONSISTENCY_RETRY_ENABLED_
 - `--provider_fallback_cooldown_seconds`: Seconds an RPC URL that failed is tried only after the other `node_http` / `node_http_fallback` URLs, before it is preferred again (default: `30`)
   - env: _PROVIDER_FALLBACK_COOLDOWN_SECONDS_
+- `--provider_fallback_total_timeout_seconds`: Total seconds one request may spend across `node_http` and the `node_http_fallback` URLs, including each URL's `provider_client_timeout_seconds` and retries. A request still waiting when it runs out fails with the client-side timeout. Only used with `node_http_fallback`. (default: twice `provider_client_timeout_seconds`)
+  - env: _PROVIDER_FALLBACK_TOTAL_TIMEOUT_SECONDS_
 - `--eip7702_authority_pending_check_enabled`: Enable checking for EIP-7702 authority pending transaction errors (default: `false`)
   - env: _EIP7702_AUTHORITY_PENDING_CHECK_ENABLED_
   - NOTE: This uses the `NODE_RPC` and thus is only viable on networks with P2P mempools. L2s with centralized sequencers will not work.

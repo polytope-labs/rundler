@@ -22,7 +22,7 @@ use rundler_types::task::{
 };
 use tower::{Layer, Service};
 
-use crate::transaction;
+use crate::{redact_url_secrets, transaction};
 
 /// Alloy provider metric layer.
 #[derive(Default)]
@@ -110,8 +110,9 @@ where
                     }
                 }
                 Err(e) => {
+                    let error = redact_url_secrets(&format!("{e:?}"));
                     tracing::warn!(
-                        "alloy provider of method {} response with error: {e:?}",
+                        "alloy provider of method {} response with error: {error}",
                         &method_name,
                     );
                     match e {

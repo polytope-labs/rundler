@@ -12,9 +12,9 @@
 // If not, see https://www.gnu.org/licenses/.
 
 use std::{
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use alloy_json_rpc::{RequestPacket, ResponsePacket, RpcError};
@@ -23,36 +23,50 @@ use futures_util::FutureExt;
 use metrics::Counter;
 use metrics_derive::Metrics;
 use regex::Regex;
+use tokio::time::{Instant, timeout_at};
 use tower::{Service, ServiceExt};
 use tracing::warn;
 use url::Url;
 
-use super::CLIENT_TIMEOUT_ERROR;
+use super::{client_timeout_error, is_client_timeout};
 
-/// Matches the path and query of URLs inside error messages. Provider URLs often carry the API
-/// key in the path (`https://lb.drpc.live/base/<key>`), and reqwest errors print the full URL.
-static URL_PATH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(https?://[^/\s()]+)/[^\s()]*").unwrap());
+/// Matches everything after the authority of a URL inside a message: the path, query and
+/// fragment. Provider URLs carry API keys there (`https://lb.drpc.live/base/<key>`,
+/// `https://host?apiKey=<key>`), and reqwest errors print the full URL.
+static URL_SECRET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(https?://[^/?#\s()]+)[/?#][^\s()]*").unwrap());
+
+/// Replaces the path, query and fragment of every URL in `message` with `/…`, so that API keys
+/// embedded in provider URLs do not reach the logs.
+pub fn redact_url_secrets(message: &str) -> String {
+    URL_SECRET_RE.replace_all(message, "$1/…").into_owned()
+}
 
 /// A transport that sends each request to an ordered list of RPC endpoints and moves on to the
 /// next endpoint only when one fails at the transport level.
 ///
 /// The first endpoint is the primary. A request goes to the first endpoint that is not cooling
-/// down; if that endpoint fails with a connection error, a non-2xx HTTP response, an unparseable
-/// body or a client-side timeout, it is put in cooldown for `cooldown` and the request is retried
-/// on the next endpoint. Endpoints in cooldown are still tried, after every healthy one, so a
-/// request only fails when every endpoint has failed it. Once the cooldown has passed the
-/// endpoint is preferred again, which lets the primary take traffic back after it recovers.
+/// down; if that endpoint fails with a connection error, a non-2xx HTTP response (including a
+/// 429), a body that is not JSON-RPC or a client-side timeout, it is put in cooldown for
+/// `cooldown` and the request moves to the next endpoint. Endpoints in cooldown are still tried,
+/// after every other endpoint, so a request only fails when every endpoint has failed it. Once
+/// its cooldown has passed an endpoint is preferred again, which lets the primary take traffic
+/// back after it recovers.
 ///
 /// A response that reached rundler is never retried elsewhere: that includes JSON-RPC error
 /// payloads such as `execution reverted`, which another node would answer the same way.
 ///
-/// Each endpoint keeps its own retry, metrics and timeout layers, so retries for rate limits and
-/// consistency errors happen on an endpoint before it counts as failed.
+/// All attempts of one request share `total_timeout`: an endpoint that is still being waited on
+/// when it runs out fails the request with the client-side timeout, and no further endpoint is
+/// tried. Per-endpoint timeouts still apply within it.
+///
+/// While the primary is in cooldown every read is served by a fallback, so fallback URLs must
+/// serve the same chain and keep up with its tip.
 #[derive(Clone)]
-pub(crate) struct FailoverTransport {
+pub(crate) struct FallbackTransport {
     endpoints: Arc<[Endpoint]>,
     cooldown: Duration,
+    total_timeout: Duration,
 }
 
 struct Endpoint {
@@ -65,30 +79,38 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn in_cooldown(&self, now: Instant) -> bool {
+    fn cooldown_until(&self) -> MutexGuard<'_, Option<Instant>> {
+        // The guarded value is a plain timestamp, so a poisoned lock still holds a usable value.
         self.cooldown_until
             .lock()
-            .unwrap()
-            .is_some_and(|until| until > now)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn in_cooldown(&self, now: Instant) -> bool {
+        self.cooldown_until().is_some_and(|until| until > now)
     }
 
     fn start_cooldown(&self, until: Instant) {
-        *self.cooldown_until.lock().unwrap() = Some(until);
+        *self.cooldown_until() = Some(until);
     }
 
     fn clear_cooldown(&self) {
-        *self.cooldown_until.lock().unwrap() = None;
+        *self.cooldown_until() = None;
     }
 }
 
-impl FailoverTransport {
-    /// Creates a failover transport over `endpoints`, in priority order.
+impl FallbackTransport {
+    /// Creates a fallback transport over `endpoints`, in priority order.
     ///
     /// Panics if `endpoints` is empty.
-    pub(crate) fn new(endpoints: Vec<(Url, BoxTransport)>, cooldown: Duration) -> Self {
+    pub(crate) fn new(
+        endpoints: Vec<(Url, BoxTransport)>,
+        cooldown: Duration,
+        total_timeout: Duration,
+    ) -> Self {
         assert!(
             !endpoints.is_empty(),
-            "failover transport needs at least one endpoint"
+            "fallback transport needs at least one endpoint"
         );
         let endpoints = endpoints
             .into_iter()
@@ -101,6 +123,7 @@ impl FailoverTransport {
         Self {
             endpoints: endpoints.into(),
             cooldown,
+            total_timeout,
         }
     }
 
@@ -113,28 +136,40 @@ impl FailoverTransport {
     }
 
     async fn send(self, request: RequestPacket) -> Result<ResponsePacket, TransportError> {
-        let metrics = FailoverMetrics::default();
+        let metrics = FallbackMetrics::default();
+        let deadline = Instant::now() + self.total_timeout;
         let order = self.attempt_order(Instant::now());
         let mut last_error = None;
 
         for (position, &index) in order.iter().enumerate() {
             let endpoint = &self.endpoints[index];
             let mut transport = endpoint.transport.clone();
-            let result = match transport.ready().await {
-                Ok(service) => service.call(request.clone()).await,
-                Err(error) => Err(error),
+            let attempt = async {
+                let service = transport.ready().await?;
+                service.call(request.clone()).await
+            };
+
+            let Ok(result) = timeout_at(deadline, attempt).await else {
+                endpoint.start_cooldown(Instant::now() + self.cooldown);
+                metrics.total_timeouts.increment(1);
+                warn!(
+                    "RPC endpoint {} did not answer within the {}s total request timeout",
+                    endpoint.label,
+                    self.total_timeout.as_secs(),
+                );
+                return Err(client_timeout_error());
             };
 
             match result {
                 Err(error) if is_endpoint_failure(&error) => {
                     endpoint.start_cooldown(Instant::now() + self.cooldown);
                     if let Some(&next) = order.get(position + 1) {
-                        metrics.failovers.increment(1);
+                        metrics.endpoint_switches.increment(1);
                         warn!(
-                            "RPC endpoint {} failed, failing over to {}: {}",
+                            "RPC endpoint {} failed, trying {}: {}",
                             endpoint.label,
                             self.endpoints[next].label,
-                            redact_urls(&error.to_string()),
+                            redact_url_secrets(&error.to_string()),
                         );
                     }
                     last_error = Some(error);
@@ -149,11 +184,11 @@ impl FailoverTransport {
         }
 
         metrics.all_endpoints_failed.increment(1);
-        Err(last_error.expect("failover transport has at least one endpoint"))
+        Err(last_error.expect("fallback transport has at least one endpoint"))
     }
 }
 
-impl Service<RequestPacket> for FailoverTransport {
+impl Service<RequestPacket> for FallbackTransport {
     type Response = ResponsePacket;
     type Error = TransportError;
     type Future = TransportFut<'static>;
@@ -173,13 +208,12 @@ impl Service<RequestPacket> for FailoverTransport {
 /// be retried on another endpoint.
 fn is_endpoint_failure(error: &TransportError) -> bool {
     match error {
-        // Connection failures, non-2xx HTTP responses and a closed backend.
+        // Connection failures, non-2xx HTTP responses (429 included) and a closed backend.
         RpcError::Transport(_) => true,
         // A body that is not JSON-RPC at all, such as a proxy's HTML error page.
         RpcError::DeserError { .. } => true,
         // The client-side timeout from the per-endpoint timeout layer.
-        RpcError::LocalUsageError(error) => error.to_string() == CLIENT_TIMEOUT_ERROR,
-        _ => false,
+        error => is_client_timeout(error),
     }
 }
 
@@ -191,17 +225,15 @@ fn endpoint_label(url: &Url) -> String {
     }
 }
 
-fn redact_urls(message: &str) -> String {
-    URL_PATH_RE.replace_all(message, "$1/…").into_owned()
-}
-
 #[derive(Metrics)]
-#[metrics(scope = "provider_failover")]
-struct FailoverMetrics {
-    #[metric(describe = "the count of requests retried on the next RPC endpoint.")]
-    failovers: Counter,
+#[metrics(scope = "provider_fallback")]
+struct FallbackMetrics {
+    #[metric(describe = "the count of requests moved on to the next RPC endpoint.")]
+    endpoint_switches: Counter,
     #[metric(describe = "the count of requests that failed on every RPC endpoint.")]
     all_endpoints_failed: Counter,
+    #[metric(describe = "the count of requests that ran out of the total request timeout.")]
+    total_timeouts: Counter,
 }
 
 #[cfg(test)]
@@ -210,12 +242,14 @@ mod tests {
 
     use alloy_json_rpc::{Id, Request, Response, ResponsePayload};
     use alloy_transport::{TransportErrorKind, TransportResult};
+    use futures_util::future;
     use serde_json::value::RawValue;
     use tower::util::service_fn;
 
     use super::*;
 
     const COOLDOWN: Duration = Duration::from_secs(30);
+    const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 
     #[derive(Clone, Copy)]
     enum Behavior {
@@ -224,6 +258,7 @@ mod tests {
         ConnectionError,
         HttpStatus(u16),
         Timeout,
+        Hang,
     }
 
     fn request() -> RequestPacket {
@@ -263,7 +298,8 @@ mod tests {
                         status,
                         "bad gateway".to_string(),
                     )),
-                    Behavior::Timeout => Err(TransportError::local_usage_str(CLIENT_TIMEOUT_ERROR)),
+                    Behavior::Timeout => Err(client_timeout_error()),
+                    Behavior::Hang => future::pending().await,
                 };
                 result
             }
@@ -272,7 +308,7 @@ mod tests {
         (url, BoxTransport::new(service))
     }
 
-    fn transport(behaviors: &[Behavior]) -> (FailoverTransport, Vec<Arc<AtomicUsize>>) {
+    fn transport(behaviors: &[Behavior]) -> (FallbackTransport, Vec<Arc<AtomicUsize>>) {
         let counters = behaviors
             .iter()
             .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -282,7 +318,10 @@ mod tests {
             .enumerate()
             .map(|(i, &b)| endpoint(i, b, counters[i].clone()))
             .collect();
-        (FailoverTransport::new(endpoints, COOLDOWN), counters)
+        (
+            FallbackTransport::new(endpoints, COOLDOWN, TOTAL_TIMEOUT),
+            counters,
+        )
     }
 
     fn calls(counters: &[Arc<AtomicUsize>]) -> Vec<usize> {
@@ -311,7 +350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_error_fails_over_to_the_next_endpoint() {
+    async fn connection_error_moves_to_the_next_endpoint() {
         let (mut transport, counters) = transport(&[Behavior::ConnectionError, Behavior::Answer]);
 
         let response = transport.call(request()).await.unwrap();
@@ -321,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_errors_and_timeouts_fail_over() {
+    async fn http_errors_and_timeouts_move_to_the_next_endpoint() {
         for failure in [
             Behavior::HttpStatus(502),
             Behavior::HttpStatus(429),
@@ -337,13 +376,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_error_payload_is_returned_without_failing_over() {
+    async fn rpc_error_payload_is_returned_without_trying_another_endpoint() {
         let (mut transport, counters) = transport(&[Behavior::RpcErrorPayload, Behavior::Answer]);
 
         let response = transport.call(request()).await.unwrap();
 
         assert!(response.is_error());
         assert_eq!(calls(&counters), vec![1, 0]);
+    }
+
+    #[test]
+    fn only_the_typed_client_timeout_counts_as_an_endpoint_failure() {
+        assert!(is_endpoint_failure(&client_timeout_error()));
+        // Same text, different error: not the timeout layer's error, so no fallback.
+        assert!(!is_endpoint_failure(&TransportError::local_usage_str(
+            "provider request timeout from client side"
+        )));
     }
 
     #[tokio::test]
@@ -401,8 +449,27 @@ mod tests {
         assert_eq!(calls(&counters), vec![1, 1]);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn total_timeout_bounds_a_request_across_endpoints() {
+        let (mut transport, counters) =
+            transport(&[Behavior::Hang, Behavior::Answer, Behavior::Answer]);
+
+        let started = Instant::now();
+        let error = transport.call(request()).await.unwrap_err();
+
+        // The request gave up when the shared budget ran out, without trying more endpoints.
+        assert_eq!(started.elapsed(), TOTAL_TIMEOUT);
+        assert!(is_client_timeout(&error));
+        assert_eq!(calls(&counters), vec![1, 0, 0]);
+
+        // The hung primary is in cooldown, so the next request is answered straight away.
+        let response = transport.call(request()).await.unwrap();
+        assert_eq!(answered_by(&response), "\"0x1\"");
+        assert_eq!(calls(&counters), vec![1, 1, 0]);
+    }
+
     #[test]
-    fn labels_and_logs_never_contain_the_url_path() {
+    fn labels_and_logs_never_contain_url_secrets() {
         let url = Url::parse("https://lb.drpc.live/base/AbCdEfSecret?x=1").unwrap();
         assert_eq!(endpoint_label(&url), "https://lb.drpc.live");
         assert_eq!(
@@ -410,8 +477,18 @@ mod tests {
             "http://127.0.0.1:8545"
         );
         assert_eq!(
-            redact_urls("error sending request for url (https://lb.drpc.live/base/AbCdEfSecret)"),
+            redact_url_secrets(
+                "error sending request for url (https://lb.drpc.live/base/AbCdEfSecret)"
+            ),
             "error sending request for url (https://lb.drpc.live/…)"
+        );
+        assert_eq!(
+            redact_url_secrets("failed: https://rpc.example?apiKey=AbCdEfSecret"),
+            "failed: https://rpc.example/…"
+        );
+        assert_eq!(
+            redact_url_secrets("node at http://127.0.0.1:8545 is down"),
+            "node at http://127.0.0.1:8545 is down"
         );
     }
 }

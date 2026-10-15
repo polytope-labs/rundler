@@ -556,6 +556,16 @@ pub struct CommonArgs {
     )]
     pub provider_fallback_cooldown_seconds: u64,
 
+    /// Total seconds one request may spend across `node_http` and the fallback URLs, including
+    /// per-URL timeouts and retries (default: twice `provider_client_timeout_seconds`)
+    #[arg(
+        long = "provider_fallback_total_timeout_seconds",
+        name = "provider_fallback_total_timeout_seconds",
+        env = "PROVIDER_FALLBACK_TOTAL_TIMEOUT_SECONDS",
+        global = true
+    )]
+    pub provider_fallback_total_timeout_seconds: Option<u64>,
+
     #[arg(
         long = "max_expected_storage_slots",
         name = "max_expected_storage_slots",
@@ -723,14 +733,15 @@ impl TryFrom<&CommonArgs> for AlloyNetworkConfig {
     type Error = anyhow::Error;
 
     fn try_from(value: &CommonArgs) -> Result<Self, Self::Error> {
+        // Positions count every comma-separated entry, empty ones included, so an error points
+        // at the entry the operator wrote.
         let rpc_fallback_urls = value
             .node_http_fallback
             .iter()
-            .map(|url| url.trim())
-            .filter(|url| !url.is_empty())
             .enumerate()
-            .map(|(index, url)| {
-                let position = index + 1;
+            .map(|(index, url)| (index + 1, url.trim()))
+            .filter(|(_, url)| !url.is_empty())
+            .map(|(position, url)| {
                 Url::parse(url).with_context(|| {
                     format!("invalid node_http_fallback URL at position {position}")
                 })
@@ -741,6 +752,7 @@ impl TryFrom<&CommonArgs> for AlloyNetworkConfig {
             rpc_url: Url::parse(value.node_http.as_ref().context("must provide node_http")?)?,
             rpc_fallback_urls,
             rpc_fallback_cooldown_seconds: value.provider_fallback_cooldown_seconds,
+            rpc_fallback_total_timeout_seconds: value.provider_fallback_total_timeout_seconds,
             client_timeout_seconds: value.provider_client_timeout_seconds,
             rate_limit_retry_enabled: value.provider_rate_limit_retry_enabled,
             consistency_retry_enabled: value.provider_consistency_retry_enabled,
@@ -1091,6 +1103,8 @@ mod tests {
             "https://first.example/key, https://second.example/key",
             "--provider_fallback_cooldown_seconds",
             "45",
+            "--provider_fallback_total_timeout_seconds",
+            "25",
         ])
         .unwrap();
 
@@ -1104,6 +1118,7 @@ mod tests {
             vec!["https://first.example/key", "https://second.example/key"]
         );
         assert_eq!(config.rpc_fallback_cooldown_seconds, 45);
+        assert_eq!(config.rpc_fallback_total_timeout_seconds, Some(25));
     }
 
     #[test]
@@ -1112,6 +1127,7 @@ mod tests {
 
         assert!(config.rpc_fallback_urls.is_empty());
         assert_eq!(config.rpc_fallback_cooldown_seconds, 30);
+        assert_eq!(config.rpc_fallback_total_timeout_seconds, None);
     }
 
     #[test]
@@ -1154,13 +1170,14 @@ mod tests {
             "--node_http",
             "https://primary.example/key",
             "--node_http_fallback",
-            "https://ok.example,not a url",
+            "https://ok.example,,not a url",
         ])
         .unwrap_err();
 
+        // The empty entry still counts, so the position matches what the operator wrote.
         assert_eq!(
             error.to_string(),
-            "invalid node_http_fallback URL at position 2"
+            "invalid node_http_fallback URL at position 3"
         );
     }
 }
