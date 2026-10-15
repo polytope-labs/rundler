@@ -19,7 +19,7 @@ use jsonrpsee::types::{
     ErrorObjectOwned,
     error::{CALL_EXECUTION_FAILED_CODE, INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE},
 };
-use rundler_provider::ProviderError;
+use rundler_provider::{ProviderError, redact_url_secrets};
 use rundler_sim::GasEstimationError;
 use rundler_types::{
     Entity, EntityType, Opcode, Timestamp, ValidationRevert,
@@ -504,7 +504,8 @@ impl From<ProviderErrorWithContext> for EthRpcError {
             }
         };
 
-        // Log full error details for debugging
+        // Log full error details for debugging, without the secrets in provider URLs
+        let inner_msg = redact_url_secrets(&inner_msg);
         if let Some(context_msg) = &e.context {
             tracing::error!("{}: provider error: {}", context_msg, inner_msg);
         } else {
@@ -537,7 +538,8 @@ impl From<EventProviderError> for EthRpcError {
             EventProviderError::InvalidRequest(message) => Self::InvalidParams(message),
             // Log full details server-side, return generic message to user
             other => {
-                tracing::error!("event provider error: {}", other);
+                let message = redact_url_secrets(&other.to_string());
+                tracing::error!("event provider error: {message}");
                 Self::Internal(anyhow::anyhow!("internal error: event provider error"))
             }
         }

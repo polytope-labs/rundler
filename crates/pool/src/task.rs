@@ -15,7 +15,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use futures::FutureExt;
-use rundler_provider::{EntryPoint, Providers, ProvidersWithEntryPointT};
+use rundler_provider::{EntryPoint, Providers, ProvidersWithEntryPointT, redact_url_secrets};
 use rundler_sim::{
     PrecheckerImpl, Simulator,
     simulation::{self, UnsafeSimulator},
@@ -97,7 +97,8 @@ where
     {
         let chain_id = self.args.chain_spec.id;
         tracing::info!("Chain id: {chain_id}");
-        tracing::info!("Http url: {:?}", self.args.http_url);
+        let http_url = redact_url_secrets(&self.args.http_url);
+        tracing::info!("Http url: {http_url}");
 
         // create chain
         let chain_settings = chain::Settings {
